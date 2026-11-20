@@ -26,7 +26,9 @@ static struct rt_mutex store_mutex;
 static bool store_ok;
 static struct watch_alarm alarm;
 static struct watch_detector detector;
-static volatile bool demo_requested;
+static volatile uint8_t demo_requested;
+static volatile uint32_t samples_read;
+static bool bench_alarm;
 static bool imu_ok, manual_requested, cancel_requested;
 static uint32_t sensor_seen;
 static lv_obj_t *title, *countdown, *caption, *action, *action_label;
@@ -93,9 +95,29 @@ MSH_CMD_EXPORT(watch_contacts, Save emergency contacts to watch flash);
 
 static void watch_demo(void)
 {
-    demo_requested = true;
+    demo_requested = 1;
 }
 MSH_CMD_EXPORT(watch_demo, Run local alarm demo without sending SOS);
+
+static void watch_bench(void)
+{
+    demo_requested = 2;
+}
+MSH_CMD_EXPORT(watch_bench, Run an SOS exercise with reserved contacts only);
+
+static void watch_status(void)
+{
+    rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
+    unsigned contacts = 0, pending = 0;
+    for (unsigned i = 0; i < WATCH_MAX_CONTACTS; ++i)
+        contacts += stored.contacts[i][0] != 0;
+    for (unsigned i = 0; i < MAX_PENDING; ++i)
+        pending += stored.pending[i].id != 0;
+    rt_mutex_release(&store_mutex);
+    rt_kprintf("WATCH_STATUS imu=%d samples=%u flash=%d display=%d ble=%d contacts=%u pending=%u\n",
+               imu_ok, (unsigned)samples_read, store_ok, title != NULL, watch_ble_ready(), contacts, pending);
+}
+MSH_CMD_EXPORT(watch_status, Show watch hardware and queue status);
 
 static void watch_pair(void)
 {
@@ -114,6 +136,7 @@ static void submit(uint32_t now)
 {
     if (alarm.demo) {
         show_notice("演示结束", now);
+        rt_kprintf("WATCH_DEMO_END\n");
         return;
     }
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
@@ -121,6 +144,16 @@ static void submit(uint32_t now)
     unsigned slot = 0;
     while (slot < MAX_PENDING && next.pending[slot].id)
         ++slot;
+    if (bench_alarm) {
+        for (unsigned i = 0; i < WATCH_MAX_CONTACTS && next.contacts[i][0]; ++i) {
+            const char *p = next.contacts[i];
+            if (strlen(p) != 12 || memcmp(p, "+1202555010", 11) != 0 || p[11] < '0' || p[11] > '2') {
+                rt_kprintf("WATCH_BENCH requires reserved test contacts\n");
+                rt_mutex_release(&store_mutex);
+                return;
+            }
+        }
+    }
     if (!next.contacts[0][0]) {
         show_notice("请设置联系人", now);
     } else if (slot == MAX_PENDING) {
@@ -316,11 +349,17 @@ int main(void)
             manual_requested = true;
         }
         if (demo_requested) {
-            demo_requested = false;
-            watch_alarm_fall(&alarm, now, true);
+            uint8_t mode = demo_requested;
+            demo_requested = 0;
+            if (alarm.phase == WATCH_IDLE) {
+                bench_alarm = mode == 2;
+                watch_alarm_fall(&alarm, now, mode == 1);
+                rt_kprintf("WATCH_DEMO_START mode=%u\n", mode);
+            }
         }
         if (manual_requested) {
             manual_requested = false;
+            bench_alarm = false;
             watch_alarm_manual(&alarm, now);
         }
         watch_alarm_update(&alarm, now, cancel_requested);
@@ -332,6 +371,7 @@ int main(void)
                 show_notice("已取消", now);
                 rt_kprintf("WATCH_CANCELLED\n");
             }
+            bench_alarm = false;
             alarm.phase = WATCH_IDLE;
             detector = (struct watch_detector){0};
         }
@@ -339,6 +379,7 @@ int main(void)
         struct watch_imu sample;
         bool sample_ready = imu_ok && watch_imu_read(&sample);
         if (sample_ready) {
+            ++samples_read;
             sensor_seen = now;
             if (alarm.phase == WATCH_IDLE && watch_detect(&detector, &sample, now)) {
                 watch_alarm_fall(&alarm, now, false);

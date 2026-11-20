@@ -45,6 +45,9 @@ class TencentSms:
         self.request_class = models.SendSmsRequest
 
     def send(self, event_id, reason, phones):
+        if any(phone in {"+12025550100", "+12025550101", "+12025550102"} for phone in phones):
+            LOG.warning("SOS %016x blocked: reserved bench number", event_id)
+            return False
         if not set(phones).issubset(self.allowed):
             LOG.warning("SOS %016x blocked: destination outside local allowlist", event_id)
             return False

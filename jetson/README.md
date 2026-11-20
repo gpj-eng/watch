@@ -39,23 +39,25 @@ cd ~/jetson
 
 ### 3. 找到并配对手表
 
-手表须运行带 `HSPI-SOS` 蓝牙广播及下文 UUID 的固件。首次用固件上的演示联系人（`+12025550100`、`+12025550101` 或 `+12025550102`）。查看设备地址，以地址绑定网关，设备名字只供查找。手机配对或调试程序可能占用手表唯一的连接，联调前先断开。
+手表须运行带 `HSPI-SOS` 蓝牙广播及下文 UUID 的固件。在手表 USB 串口（1000000、8N1）输入 `watch_contacts +12025550100 +12025550101` 保存演示联系人。查看设备地址，以地址绑定网关。手机配对或调试程序可能占用连接，联调前先断开。
 
 ```text
 bluetoothctl
 power on
-agent on
+agent KeyboardOnly
 default-agent
 scan on
 # 等待出现 HSPI-SOS，抄下自己的手表地址
 scan off
+# 此时在手表 USB 串口输入 watch_pair，60 秒内执行 pair
 pair AA:BB:CC:DD:EE:FF
+# 输入手表显示的六位配对码
 trust AA:BB:CC:DD:EE:FF
 info AA:BB:CC:DD:EE:FF
 quit
 ```
 
-用实际地址替换 `AA:BB:CC:DD:EE:FF`。确认 `Paired: yes`。如果手表固件暂未实现绑定，只能用演示号码做接收联调，并在下一步命令末尾附加 `--bench-unpaired`。真实联系人需要先验证手表固件只在加密连接建立后发送含号码的通知，且只有授权的 Jetson 能启用通知和写入回执。[BlueZ Device1](https://bluez.readthedocs.io/en/latest/device-api/)
+用实际地址替换 `AA:BB:CC:DD:EE:FF`。确认 `Paired: yes`。黄山派固件要求带认证的加密连接，配对窗口关闭后拒绝新配对。启用真实联系人前验证未配对设备无法启用通知和写入回执。[BlueZ Device1](https://bluez.readthedocs.io/en/latest/device-api/)
 
 ### 4. 连接并订阅，保持短信关闭
 
@@ -69,8 +71,8 @@ cd ~/jetson
 
 ### 5. 实机验收 SOS 和回执
 
-1. 通过手表的测试入口触发疑似跌倒。屏幕进入确认倒计时，按取消键。Jetson 应无对应的 SOS 入库日志。
-2. 再触发测试，等倒计时结束。Jetson 应显示 `committed: reason=1` 和 `ACK ... sent: status=1`。两名演示联系人应作为同一事件入库。
+1. 在手表 USB 串口输入 `watch_bench`。屏幕进入 30 秒倒计时，按 KEY2。Jetson 应无对应的 SOS 入库日志。
+2. 再输入 `watch_bench`，等待倒计时结束。Jetson 应显示 `committed: reason=1` 和 `ACK ... sent: status=1`。两名演示联系人应作为同一事件入库。若仅检查本机提醒，使用 `watch_demo`。
 3. 触发手动 SOS。应收到另一事件，`reason=2`。该事件无需等待跌倒取消倒计时。
 4. 检查重发和重连。对同一个 `event_id`，每个联系人在一个事件中只保存一次。手表应以原编号和原联系人顺序重发同一事件。
 5. 分别记录 1 分钟静止及 5 分钟日常动作，统计丢包和重连情况。后续在 Jetson 融合其他传感器时，先用 `received_monotonic_s` 做同机粗对时，保留手表 `uptime_ms` 估算偏移与漂移。BLE 到达时间包含传输延迟。
