@@ -1,0 +1,47 @@
+# Local SDK, toolchain, downloaded packages and utilities
+/.watch-tools/
+
+# Firmware build output and SCons cache
+/firmware/project/build*/
+/firmware/src/lcpu_img.c
+.sconsign.dblite
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.exe
+*.dll
+
+# Python environments and bytecode
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local logs, recordings and databases
+*.log
+*.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Local credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
