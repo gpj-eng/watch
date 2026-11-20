@@ -104,6 +104,17 @@ static void start_advertisement(void)
         sibles_advertising_start(advertisement);
 }
 
+static void mark_authenticated(uint8_t connection, uint8_t auth)
+{
+    if (connection != conn)
+        return;
+    authenticated = (auth & (GAP_AUTH_MITM | GAP_AUTH_BOND)) == (GAP_AUTH_MITM | GAP_AUTH_BOND);
+    if (authenticated) {
+        pair_open = false;
+        pair_pin = 1000000;
+    }
+}
+
 static int ble_event(uint16_t event, uint8_t *data, uint16_t len, uint32_t context)
 {
     (void)len;
@@ -129,13 +140,13 @@ static int ble_event(uint16_t event, uint8_t *data, uint16_t len, uint32_t conte
         break;
     case BLE_GAP_ENCRYPT_IND: {
         ble_gap_encrypt_ind_t *ind = (void *)data;
-        if (ind->conn_idx == conn) {
-            authenticated = (ind->auth & (GAP_AUTH_MITM | GAP_AUTH_BOND)) == (GAP_AUTH_MITM | GAP_AUTH_BOND);
-            if (authenticated) {
-                pair_open = false;
-                pair_pin = 1000000;
-            }
-        }
+        mark_authenticated(ind->conn_idx, ind->auth);
+        break;
+    }
+    case BLE_GAP_BOND_IND: {
+        ble_gap_bond_ind_t *ind = (void *)data;
+        if (ind->info == GAPC_PAIRING_SUCCEED)
+            mark_authenticated(ind->conn_idx, ind->data.auth.info);
         break;
     }
     case CONNECTION_MANAGER_BOND_AUTH_INFOR: {

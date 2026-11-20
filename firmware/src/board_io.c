@@ -64,30 +64,38 @@ bool watch_imu_read(struct watch_imu *sample)
 
 void watch_motor(bool on)
 {
-    static bool running, owns_rail;
+    static bool requested, running, owns_rail;
     static struct rt_device_pwm *pwm;
-    if (on == running)
+    if (on == requested)
         return;
+    requested = on;
     if (on) {
-        pwm = (struct rt_device_pwm *)rt_device_find("pwm2");
-        if (!pwm)
+        pwm = (struct rt_device_pwm *)rt_device_find("pwmt1");
+        if (!pwm) {
+            rt_kprintf("WATCH_VIB pwm device missing\n");
             return;
+        }
         owns_rail = !(hwp_pmuc->PERI_LDO & PMUC_PERI_LDO_EN_VDD33_LDO3);
-        if (HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, true, true) != HAL_OK)
+        if (HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, true, true) != HAL_OK) {
+            rt_kprintf("WATCH_VIB rail enable failed\n");
             return;
+        }
         HAL_PIN_Set(PAD_PA20, GPTIM1_CH2, PIN_NOPULL, 1);
         if (rt_pwm_set(pwm, 2, 1000000u, 500000u) != RT_EOK || rt_pwm_enable(pwm, 2) != RT_EOK) {
             HAL_PIN_Set(PAD_PA20, GPIO_A20, PIN_PULLDOWN, 1);
             if (owns_rail)
                 HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, false, false);
+            rt_kprintf("WATCH_VIB pwm enable failed\n");
             return;
         }
-    } else {
+        rt_kprintf("WATCH_VIB on ms=%u\n", (unsigned)watch_now_ms());
+    } else if (running) {
         rt_pwm_disable(pwm, 2);
         HAL_PIN_Set(PAD_PA20, GPIO_A20, PIN_PULLDOWN, 1);
         rt_pin_mode(20, PIN_MODE_INPUT_PULLDOWN);
         if (owns_rail)
             HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, false, false);
+        rt_kprintf("WATCH_VIB off ms=%u\n", (unsigned)watch_now_ms());
     }
     running = on;
 }
