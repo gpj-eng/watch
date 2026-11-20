@@ -5,6 +5,7 @@
 #include <flashdb.h>
 #include <fal.h>
 #include <string.h>
+#include <time.h>
 #include <littlevgl2rtt.h>
 #include <lvgl.h>
 LV_FONT_DECLARE(watch_cjk);
@@ -31,7 +32,7 @@ static volatile uint32_t samples_read;
 static bool bench_alarm;
 static bool imu_ok, manual_requested, cancel_requested;
 static uint32_t sensor_seen;
-static lv_obj_t *title, *countdown, *caption, *action, *action_label;
+static lv_obj_t *screen, *title, *reading, *caption, *action, *action_label;
 static const char *notice;
 static uint32_t notice_started;
 
@@ -273,12 +274,11 @@ static void init_ui(void)
 {
     if (littlevgl2rtt_init("lcd") != RT_EOK)
         return;
-    lv_obj_t *screen = lv_screen_active();
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x111919), 0);
+    screen = lv_screen_active();
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     const lv_font_t *font = &watch_cjk;
     title = label(screen, 63, font, 0xf3f8f4);
-    countdown = label(screen, 112, &lv_font_montserrat_48, 0xffffff);
+    reading = label(screen, 126, &lv_font_montserrat_48, 0xffffff);
     caption = label(screen, 212, font, 0xc7d6d0);
     action = lv_button_create(screen);
     lv_obj_set_size(action, 300, 82);
@@ -290,29 +290,79 @@ static void init_ui(void)
     lv_obj_center(action_label);
 }
 
+enum watch_view { VIEW_NONE, VIEW_CLOCK, VIEW_FALL, VIEW_DEMO, VIEW_GESTURE, VIEW_PAIR };
+
+static void update_label(lv_obj_t *object, const char *text)
+{
+    if (strcmp(lv_label_get_text(object), text) != 0)
+        lv_label_set_text(object, text);
+}
+
 static void render(uint32_t now)
 {
     if (!title)
         return;
+    static enum watch_view view;
+    static uint32_t last_clock_read;
+    static char clock_date[11], clock_time[6];
     const bool active = alarm.phase == WATCH_COUNTDOWN;
-    const bool linked = watch_ble_ready();
     unsigned pin = watch_ble_pin();
-    if (active) {
-        lv_label_set_text(title, alarm.demo ? "演示提醒" : "疑似跌倒");
-        lv_label_set_text_fmt(countdown, "%02u", watch_alarm_seconds(&alarm, now));
-        lv_label_set_text(caption, alarm.demo ? "演示不会发送短信" : "秒后提交求助");
-    } else if (pin < 1000000u) {
-        lv_label_set_text(title, "蓝牙配对");
-        lv_label_set_text_fmt(countdown, "%06u", pin);
-        lv_label_set_text(caption, "请在接收端输入");
-    } else {
-        lv_label_set_text(title, notice && now - notice_started < 12000u ? notice : "安全手表");
-        lv_label_set_text(countdown, "SOS");
-        lv_label_set_text(caption, !imu_ok || now - sensor_seen > 500u ? "传感器异常" :
-                                      linked ? "接收端已连接" : "接收端未连接");
+    enum watch_view next = VIEW_CLOCK;
+    if (active)
+        next = alarm.demo || bench_alarm ? VIEW_DEMO : alarm.reason == WATCH_FALL ? VIEW_FALL : VIEW_GESTURE;
+    else if (pin < 1000000u)
+        next = VIEW_PAIR;
+
+    if (next == VIEW_CLOCK && (view != next || now - last_clock_read >= 1000u)) {
+        time_t stamp = time(NULL);
+        struct tm local;
+        if (localtime_r(&stamp, &local) && local.tm_year >= 120) {
+            strftime(clock_date, sizeof(clock_date), "%Y-%m-%d", &local);
+            strftime(clock_time, sizeof(clock_time), "%H:%M", &local);
+        } else {
+            clock_date[0] = '\0';
+            strcpy(clock_time, "--:--");
+        }
+        last_clock_read = now;
     }
-    lv_obj_set_style_bg_color(action, lv_color_hex(active ? 0x286354 : 0xa73732), 0);
-    lv_label_set_text(action_label, active ? "我没事" : "长按求助");
+
+    if (view != next) {
+        static const char *const names[] = {
+            [VIEW_CLOCK] = "clock", [VIEW_FALL] = "fall", [VIEW_DEMO] = "demo",
+            [VIEW_GESTURE] = "gesture", [VIEW_PAIR] = "pair",
+        };
+        lv_obj_set_style_bg_color(screen, lv_color_hex(active ? 0x381b1c : 0x111919), 0);
+        lv_obj_set_style_text_color(reading, lv_color_hex(active ? 0xffcb91 : 0xffffff), 0);
+        lv_obj_set_style_text_font(title, next == VIEW_CLOCK ? &lv_font_montserrat_14 : &watch_cjk, 0);
+        lv_obj_set_style_bg_color(action, lv_color_hex(active ? 0x286354 : 0xa73732), 0);
+        update_label(action_label, active ? "我没事" : "长按求助");
+        rt_kprintf("WATCH_SCREEN %s\n", names[next]);
+        view = next;
+    }
+
+    char value[8];
+    if (active) {
+        rt_snprintf(value, sizeof(value), "%02u", watch_alarm_seconds(&alarm, now));
+        update_label(title, next == VIEW_FALL ? "疑似跌倒" : next == VIEW_GESTURE ? "手势求助" : "演示提醒");
+        update_label(reading, value);
+        update_label(caption, alarm.demo ? "演示不会发送短信" : "短按取消");
+    } else if (next == VIEW_PAIR) {
+        rt_snprintf(value, sizeof(value), "%06u", pin);
+        update_label(title, "蓝牙配对");
+        update_label(reading, value);
+        update_label(caption, "请在接收端输入");
+    } else {
+        const char *status = "";
+        if (!imu_ok || now - sensor_seen > 500u)
+            status = "传感器异常";
+        else if (notice && now - notice_started < 12000u)
+            status = notice;
+        else if (!clock_date[0])
+            status = "待设置";
+        update_label(title, clock_date);
+        update_label(reading, clock_time);
+        update_label(caption, status);
+    }
 }
 
 int main(void)
