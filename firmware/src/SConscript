@@ -1,0 +1,6 @@
+from building import *
+
+cwd = GetCurrentDir()
+src = [f for f in Glob('*.c') if f.name != 'lcpu_img.c']
+group = DefineGroup('Huangshan SOS Watch', src, CPPPATH=[cwd], depend=[''])
+Return('group')
