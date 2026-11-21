@@ -11,3 +11,7 @@ config WATCH_SCREEN_TIMEOUT_MS
 config WATCH_DIAL_FACE_UP_NEGATIVE_Z
     bool "Watch reports negative Z acceleration with the dial facing up"
     default y
+
+config WATCH_SOS_RESOLVED_UPLINK
+    bool "Send SOS resolution frames to a compatible BLE gateway"
+    default n

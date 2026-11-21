@@ -48,15 +48,30 @@ static void test_alarm(void)
     assert(watch_alarm_manual(&alarm) == EVT_ALARM_NONE);
     watch_alarm_fall(&alarm, 12001u, false);
     assert(alarm.phase == ALARM_STATE_SOS_ACTIVE);
-    assert(!watch_alarm_finish_voice(&alarm, EVT_ALARM_NONE));
-    assert(watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_STOPPED));
-    assert(!watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_STOPPED));
+    assert(watch_alarm_vibrate(&alarm, 12000u));
+    assert(watch_alarm_vibrate(&alarm, 12299u));
+    assert(!watch_alarm_vibrate(&alarm, 12300u));
+    assert(!watch_alarm_vibrate(&alarm, 12999u));
+    assert(watch_alarm_vibrate(&alarm, 13000u));
+    assert(watch_alarm_hold(&alarm, true, false, 15500u) == EVT_ALARM_NONE);
+    assert(!alarm.holding);
+    assert(watch_alarm_hold(&alarm, true, true, 16000u) == EVT_ALARM_NONE);
+    assert(watch_alarm_hold(&alarm, true, false, 17000u) == EVT_ALARM_NONE && alarm.holding);
+    assert(watch_alarm_hold(&alarm, false, false, 17000u) == EVT_ALARM_NONE);
+    assert(!alarm.holding && alarm.phase == ALARM_STATE_SOS_ACTIVE);
+    uint32_t press = UINT32_MAX - 1000u;
+    assert(watch_alarm_hold(&alarm, true, true, press) == EVT_ALARM_NONE);
+    assert(watch_alarm_hold(&alarm, true, false, press + 2999u) == EVT_ALARM_NONE);
+    assert(watch_alarm_hold(&alarm, true, false, press + 3000u) == EVT_SOS_RESOLVED);
+    assert(!alarm.holding && !watch_alarm_vibrate(&alarm, press + 3000u));
+    assert(watch_alarm_hold(&alarm, true, false, press + 3001u) == EVT_ALARM_NONE);
     assert(watch_alarm_manual(&alarm) == EVT_SOS_MANUAL);
     assert(alarm.phase == ALARM_STATE_IDLE && alarm.reason == WATCH_MANUAL_SOS);
 
     watch_alarm_fall(&alarm, 0, true);
     assert(watch_alarm_update(&alarm, 12000u, false) == EVT_SOS_TIMEOUT);
-    assert(alarm.demo && watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_DONE));
+    assert(alarm.demo && watch_alarm_hold(&alarm, true, true, 13000u) == EVT_ALARM_NONE);
+    assert(watch_alarm_hold(&alarm, true, false, 16000u) == EVT_SOS_RESOLVED);
     assert(alarm.phase == ALARM_STATE_IDLE);
 }
 
@@ -87,10 +102,23 @@ int main(void)
     frame[1] = 2;
     memset(&frame[10], 0, 10);
     uint64_t id = 0;
-    uint8_t status = 0;
-    assert(watch_frame_ack(frame, sizeof(frame), &id, &status));
-    assert(id == sos.id && status == 2);
+    uint8_t type = 0, status = 0;
+    assert(watch_frame_ack(frame, sizeof(frame), &type, &id, &status));
+    assert(type == WATCH_SOS_ACK_TYPE && id == sos.id && status == 2);
+    frame[0] = WATCH_RESOLVED_ACK_TYPE;
+    assert(watch_frame_ack(frame, sizeof(frame), &type, &id, &status));
+    assert(type == WATCH_RESOLVED_ACK_TYPE && id == sos.id && status == 2);
+    frame[10] = 1;
+    assert(!watch_frame_ack(frame, sizeof(frame), &type, &id, &status));
+    const uint8_t device[] = {0xf0, 0xab, 0x32, 0x12, 0x34, 0x56};
+    const uint8_t resolved_frame[] = {
+        0x03, 0x01, 0x01, 0, 0, 0, 0x56, 0x34, 0x12, 0xfe,
+        0xf0, 0xab, 0x32, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78,
+    };
+    assert(watch_frame_resolved(frame, sos.id, device, 0x78563412u));
+    assert(!memcmp(frame, resolved_frame, sizeof(resolved_frame)));
+    assert(!watch_frame_resolved(frame, 0, device, 0));
 
-    puts("PASS alarm timings, cancellation, synthetic fall and SOS/ACK frames");
+    puts("PASS alarm timings, hold and release, synthetic fall, and SOS/resolved frames");
     return 0;
 }

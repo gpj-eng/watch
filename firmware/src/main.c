@@ -28,6 +28,9 @@ LV_FONT_DECLARE(watch_dial_digits);
 #define IMU_ACTIVITY_GAP_MS 100u
 #define WATCH_PANEL_BRIGHTNESS 50u
 #define MAX_PENDING 4
+#define MAX_RESOLUTIONS 8
+#define RESOLVED_NOTICE_MS 2000u
+#define HOLD_DRAW_MS 25u
 #define STORE_VERSION 0x48530201u
 
 struct persisted {
@@ -37,7 +40,18 @@ struct persisted {
     struct watch_sos pending[MAX_PENDING];
 };
 
+struct resolution {
+    uint64_t original_id;
+    uint32_t at_ms;
+};
+
 static struct persisted stored = {.version = STORE_VERSION};
+static struct resolution resolutions[MAX_RESOLUTIONS];
+static bool resolutions_ok, resolutions_dirty;
+static uint32_t resolution_save_at;
+static uint64_t active_sos_id;
+static bool resolved_notice;
+static uint32_t resolved_at;
 static struct fdb_kvdb database;
 static struct rt_mutex store_mutex;
 static bool store_ok, database_ready;
@@ -55,6 +69,7 @@ enum watch_page { PAGE_NONE, PAGE_DIAL, PAGE_FUNCTION, PAGE_SLEEP, PAGE_ALARM };
 static enum watch_page visible_page;
 static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label, *sync_hint;
 static lv_obj_t *dial_date, *dial_digits[5];
+static lv_obj_t *resolve_arc, *resolve_percent, *resolve_text;
 static rt_device_t lcd;
 static const char *notice;
 static uint32_t notice_started;
@@ -92,6 +107,16 @@ static void load_store(void)
             stored = loaded;
         else if (length != 0)
             store_ok = false;
+    }
+    if (database_ready) {
+        struct resolution loaded_resolutions[MAX_RESOLUTIONS] = {0};
+        size_t length = fdb_kv_get_blob(&database, "resolved",
+                                       fdb_blob_make(&blob, loaded_resolutions, sizeof(loaded_resolutions)));
+        resolutions_ok = length == 0 || length == sizeof(loaded_resolutions);
+        if (length == sizeof(loaded_resolutions))
+            memcpy(resolutions, loaded_resolutions, sizeof(resolutions));
+        if (!resolutions_ok)
+            rt_kprintf("WATCH_RESOLVED storage=invalid\n");
     }
 }
 
@@ -171,10 +196,11 @@ static void show_notice(const char *message, uint32_t now)
     notice_started = now;
 }
 
-static void submit(uint32_t now)
+static uint64_t submit(uint32_t now)
 {
     if (alarm.demo)
-        return;
+        return 0;
+    uint64_t committed = 0;
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
     struct persisted next = stored;
     unsigned slot = 0;
@@ -186,7 +212,7 @@ static void submit(uint32_t now)
             if (strlen(p) != 12 || memcmp(p, "+1202555010", 11) != 0 || p[11] < '0' || p[11] > '2') {
                 rt_kprintf("WATCH_BENCH requires reserved test contacts\n");
                 rt_mutex_release(&store_mutex);
-                return;
+                return 0;
             }
         }
     }
@@ -203,14 +229,115 @@ static void submit(uint32_t now)
         }
         if (save(&next)) {
             stored = next;
+            committed = item->id;
             show_notice("等待接收端", now);
-            rt_kprintf("WATCH_SOS queued reason=%u contacts=%u\n", item->reason, item->count);
+            rt_kprintf("WATCH_SOS queued reason=%u contacts=%u id=%08x%08x\n", item->reason, item->count,
+                       (unsigned)(committed >> 32), (unsigned)committed);
         } else {
             show_notice("闪存存储失败", now);
         }
     }
     rt_mutex_release(&store_mutex);
+    return committed;
 }
+
+static void queue_resolution(uint64_t id, uint32_t now)
+{
+    if (!id)
+        return;
+    if (!resolutions_ok) {
+        rt_kprintf("WATCH_RESOLVED storage=unavailable\n");
+        return;
+    }
+    for (unsigned i = 0; i < MAX_RESOLUTIONS; ++i) {
+        if (!resolutions[i].original_id) {
+            resolutions[i] = (struct resolution){.original_id = id, .at_ms = now};
+            resolutions_dirty = true;
+            resolution_save_at = now;
+            return;
+        }
+    }
+    rt_kprintf("WATCH_RESOLVED storage=queue_full\n");
+}
+
+static bool save_resolutions(struct resolution entries[MAX_RESOLUTIONS])
+{
+    struct fdb_blob blob;
+    return fdb_kv_set_blob(&database, "resolved",
+                          fdb_blob_make(&blob, entries, sizeof(resolutions))) == FDB_NO_ERR;
+}
+
+#ifdef WATCH_SOS_RESOLVED_UPLINK
+static void acknowledge_resolution(uint64_t id, uint8_t status)
+{
+    for (unsigned i = 0; i < MAX_RESOLUTIONS; ++i) {
+        if (resolutions[i].original_id != id)
+            continue;
+        /* A durable Jetson ACK hands delivery ownership to the gateway. */
+        struct resolution entry = resolutions[i];
+        resolutions[i] = (struct resolution){0};
+        if (save_resolutions(resolutions)) {
+            resolutions_dirty = false;
+            rt_kprintf("WATCH_RESOLVED_ACK id=%08x%08x status=%u\n",
+                       (unsigned)(id >> 32), (unsigned)id, status);
+        } else {
+            resolutions[i] = entry;
+            rt_kprintf("WATCH_RESOLVED storage=ack_write_failed\n");
+        }
+        return;
+    }
+}
+
+static bool send_resolution(uint32_t now)
+{
+    static uint32_t retry;
+    static bool connected;
+    static uint64_t last_sent;
+    static uint8_t device[WATCH_DEVICE_ID_SIZE];
+    static bool have_device;
+
+    if (!watch_ble_ready()) {
+        connected = false;
+        last_sent = 0;
+        return false;
+    }
+    if (!connected) {
+        connected = true;
+        retry = now;
+    }
+    if (resolutions_dirty || (int32_t)(now - retry) < 0)
+        return false;
+    const struct resolution *first = NULL, *next = NULL;
+    for (unsigned i = 0; i < MAX_RESOLUTIONS; ++i) {
+        const struct resolution *item = &resolutions[i];
+        if (!item->original_id)
+            continue;
+        if (!first || item->original_id < first->original_id)
+            first = item;
+        if (item->original_id > last_sent && (!next || item->original_id < next->original_id))
+            next = item;
+    }
+    const struct resolution *item = next ? next : first;
+    if (!item) {
+        last_sent = 0;
+        return false;
+    }
+    uint8_t frame[WATCH_FRAME_SIZE];
+    have_device = have_device || watch_ble_device_id(device);
+    if (!have_device || !watch_frame_resolved(frame, item->original_id, device, item->at_ms)) {
+        retry = now + 2000u;
+        rt_kprintf("WATCH_RESOLVED device_id=unavailable\n");
+        return false;
+    }
+    if (watch_ble_send(frame)) {
+        last_sent = item->original_id;
+        retry = now + 1000u;
+    } else {
+        retry = now + 100u;
+    }
+    return true;
+}
+#endif
 
 static void start_countdown(uint32_t now, bool demo)
 {
@@ -235,11 +362,22 @@ static void handle_alarm_event(enum watch_alarm_event event, uint32_t now)
         detector = (struct watch_detector){0};
         break;
     case EVT_SOS_TIMEOUT:
-        watch_motor(false, alarm.cfg->vib_pwm_duty);
+        watch_motor(watch_alarm_vibrate(&alarm, now), alarm.cfg->vib_pwm_duty);
         rt_kprintf("WATCH_SOS_TIMEOUT ms=%u event=EVT_SOS_TIMEOUT\n", (unsigned)now);
         watch_voice_set(WATCH_VOICE_HELP);
-        submit(now);
+        active_sos_id = submit(now);
         bench_alarm = false;
+        break;
+    case EVT_SOS_RESOLVED:
+        watch_motor(false, alarm.cfg->vib_pwm_duty);
+        watch_voice_set(WATCH_VOICE_OFF);
+        resolved_notice = true;
+        resolved_at = now;
+        detector = (struct watch_detector){0};
+        queue_resolution(active_sos_id, now);
+        rt_kprintf("WATCH_RESOLVED ms=%u id=%08x%08x\n", (unsigned)now,
+                   (unsigned)(active_sos_id >> 32), (unsigned)active_sos_id);
+        active_sos_id = 0;
         break;
     case EVT_SOS_MANUAL:
         bench_alarm = false;
@@ -257,8 +395,21 @@ static bool outbox(uint32_t now)
     static uint8_t recipient;
     static uint64_t sending_id, last_completed;
     uint64_t id;
-    uint8_t status;
-    for (unsigned n = 0; n < 8 && watch_ble_ack(&id, &status); ++n) {
+    uint8_t type, status;
+    if (resolutions_dirty && (int32_t)(now - resolution_save_at) >= 0) {
+        resolutions_dirty = !save_resolutions(resolutions);
+        if (resolutions_dirty) {
+            resolution_save_at = now + 2000u;
+            rt_kprintf("WATCH_RESOLVED storage=write_failed\n");
+        }
+    }
+    for (unsigned n = 0; n < 8 && watch_ble_ack(&type, &id, &status); ++n) {
+        if (type == WATCH_RESOLVED_ACK_TYPE) {
+#ifdef WATCH_SOS_RESOLVED_UPLINK
+            acknowledge_resolution(id, status);
+#endif
+            continue;
+        }
         for (unsigned i = 0; i < MAX_PENDING; ++i) {
             if (stored.pending[i].id != id)
                 continue;
@@ -397,6 +548,25 @@ static void init_ui(void)
     lv_obj_set_style_radius(sync_hint, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(sync_hint, lv_color_hex(0xffcb91), 0);
     lv_obj_set_style_bg_opa(sync_hint, LV_OPA_COVER, 0);
+    resolve_arc = lv_arc_create(screen);
+    lv_obj_set_size(resolve_arc, 210, 210);
+    lv_obj_center(resolve_arc);
+    lv_arc_set_rotation(resolve_arc, 270);
+    lv_arc_set_bg_angles(resolve_arc, 0, 360);
+    lv_arc_set_range(resolve_arc, 0, 1000);
+    lv_arc_set_value(resolve_arc, 0);
+    lv_obj_set_style_arc_width(resolve_arc, 16, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(resolve_arc, 16, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(resolve_arc, lv_color_hex(0x695356), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(resolve_arc, lv_color_hex(0xffcb91), LV_PART_INDICATOR);
+    lv_obj_remove_style(resolve_arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(resolve_arc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(resolve_arc, LV_OBJ_FLAG_HIDDEN);
+    resolve_percent = label(resolve_arc, 0, &lv_font_montserrat_48, 0xffffff);
+    lv_obj_set_width(resolve_percent, 160);
+    lv_obj_center(resolve_percent);
+    resolve_text = label(screen, 355, font, 0xffffff);
+    lv_obj_add_flag(resolve_text, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void update_label(lv_obj_t *object, const char *text)
@@ -522,11 +692,30 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
         return;
     }
 
+    const bool showing_hold = alarm_page && (alarm.holding || resolved_notice);
+    set_visible(resolve_arc, showing_hold);
+    set_visible(resolve_text, showing_hold);
+    if (alarm_page) {
+        set_visible(reading, !showing_hold);
+        set_visible(caption, !showing_hold);
+    }
+    if (!showing_hold)
+        lv_arc_set_value(resolve_arc, 0);
     set_visible(action, next == PAGE_FUNCTION || counting);
     set_visible(sync_hint, next == PAGE_DIAL && !watch_time_is_synced());
     char value[8];
     const bool notifying = notice && now - notice_started < NOTICE_MS;
-    if (counting) {
+    if (showing_hold) {
+        uint32_t progress = resolved_notice ? 1000u :
+            (uint32_t)((uint64_t)(now - alarm.hold_started_ms) * 1000u / alarm.cfg->cancel_hold_ms);
+        if (progress > 1000u)
+            progress = 1000u;
+        lv_arc_set_value(resolve_arc, (int32_t)progress);
+        rt_snprintf(value, sizeof(value), "%u%%", (unsigned)(progress / 10u));
+        update_label(resolve_percent, value);
+        update_label(title, alarm.demo ? "演示提醒" : "求助");
+        update_label(resolve_text, resolved_notice ? "已解除警报" : "长按解除警报");
+    } else if (counting) {
         rt_snprintf(value, sizeof(value), "%02u", watch_alarm_seconds(&alarm, now));
         update_label(title, alarm.demo || bench_alarm ? "演示提醒" : "疑似跌倒");
         update_label(reading, value);
@@ -535,7 +724,8 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
     } else if (alarm_page) {
         update_label(title, alarm.demo ? "演示提醒" : "求助");
         update_label(reading, "SOS");
-        update_label(caption, alarm.demo ? "演示不会发送短信" : notifying ? notice : "");
+        update_label(caption, alarm.phase == ALARM_STATE_SOS_ACTIVE ? "长按解除警报" :
+                             alarm.demo ? "演示不会发送短信" : notifying ? notice : "");
     } else if (next == PAGE_FUNCTION) {
         update_label(action_label, "长按求助");
         if (pin < 1000000u) {
@@ -586,7 +776,7 @@ int main(void)
     rt_kprintf("WATCH_READY imu=%d storage=%d display=%d\n", imu_ok, store_ok, title != NULL);
     uint32_t last_draw = 0, down_since = 0;
     uint16_t seq = 0;
-    bool key_raw = false, key_stable = false, handled = false, pressed_in_sos = false;
+    bool key_raw = false, key_stable = false, handled = false;
     uint32_t key_changed = 0;
     enum watch_page page = PAGE_DIAL;
     bool manual_page = false;
@@ -604,17 +794,11 @@ int main(void)
         uint32_t now = watch_now_ms();
 
         enum watch_alarm_event voice_event = watch_voice_take_event();
-        if (watch_alarm_finish_voice(&alarm, voice_event)) {
-            watch_voice_set(WATCH_VOICE_OFF);
-            detector = (struct watch_detector){0};
-            if (alarm.demo) {
-                show_notice("演示结束", now);
-                rt_kprintf("WATCH_DEMO_END ms=%u\n", (unsigned)now);
-            }
+        if (voice_event != EVT_ALARM_NONE)
             rt_kprintf("WATCH_VOICE_EXIT ms=%u event=%s\n", (unsigned)now,
-                       voice_event == EVT_SOS_VOICE_STOPPED ? "EVT_SOS_VOICE_STOPPED" :
-                       voice_event == EVT_SOS_VOICE_DONE ? "EVT_SOS_VOICE_DONE" : "EVT_SOS_VOICE_FAILED");
-        }
+                       voice_event == EVT_SOS_VOICE_DONE ? "audio_limit" : "audio_failed");
+        if (resolved_notice && now - resolved_at >= RESOLVED_NOTICE_MS)
+            resolved_notice = false;
 
         if (pressed != key_raw || (key_irq_ready && edge_ms != key_changed)) {
             key_raw = pressed;
@@ -626,28 +810,26 @@ int main(void)
             if (key_stable) {
                 key2_activity = true;
                 down_since = key_changed + KEY2_DEBOUNCE_MS;
-                handled = watch_alarm_counting(&alarm);
-                pressed_in_sos = alarm.phase == ALARM_STATE_SOS_ACTIVE;
-                cancel_requested |= handled;
+                bool counting = watch_alarm_counting(&alarm);
+                handled = counting || alarm.phase == ALARM_STATE_SOS_ACTIVE || resolved_notice;
+                cancel_requested |= counting;
             }
         }
-        if (key_raw && key_stable && !handled) {
-            if (pressed_in_sos && alarm.phase == ALARM_STATE_SOS_ACTIVE &&
-                now - down_since >= alarm.cfg->sos_voice_stop_hold_ms) {
-                handled = true;
-                rt_kprintf("WATCH_VOICE_STOP_REQUEST ms=%u source=KEY2 hold_ms=%u\n",
-                           (unsigned)now, (unsigned)(now - down_since));
-                watch_voice_set(WATCH_VOICE_STOP_HELP);
-            } else if (!pressed_in_sos && alarm.phase == ALARM_STATE_IDLE &&
-                       now - down_since >= KEY2_MANUAL_HOLD_MS) {
-                handled = true;
-                manual_requested = true;
-            }
+        bool was_holding = alarm.holding;
+        enum watch_alarm_event hold_event = watch_alarm_hold(&alarm, key_raw && key_stable, key2_activity, now);
+        if (was_holding != alarm.holding)
+            rt_kprintf("WATCH_KEY2_HOLD ms=%u state=%s\n", (unsigned)now,
+                       alarm.holding ? "start" : hold_event == EVT_SOS_RESOLVED ? "complete" : "reset");
+        handle_alarm_event(hold_event, now);
+        if (key_raw && key_stable && !handled && !resolved_notice && alarm.phase == ALARM_STATE_IDLE &&
+                now - down_since >= KEY2_MANUAL_HOLD_MS) {
+            handled = true;
+            manual_requested = true;
         }
         if (demo_requested) {
             uint8_t mode = demo_requested;
             demo_requested = 0;
-            if (alarm.phase == ALARM_STATE_IDLE) {
+            if (alarm.phase == ALARM_STATE_IDLE && !resolved_notice) {
                 bench_alarm = mode == 2;
                 start_countdown(now, mode == 1);
                 rt_kprintf("WATCH_DEMO_START mode=%u\n", mode);
@@ -677,7 +859,7 @@ int main(void)
                 rt_kprintf("WATCH_POSE ax=%d ay=%d az=%d face_up=%d mg\n",
                            sample.ax, sample.ay, sample.az, (int)watch_wrist_face_up_mg(&sample));
             }
-            if (alarm.phase == ALARM_STATE_IDLE && watch_detect(&detector, &sample, now)) {
+            if (alarm.phase == ALARM_STATE_IDLE && !resolved_notice && watch_detect(&detector, &sample, now)) {
                 start_countdown(now, false);
                 rt_kprintf("WATCH_FALL candidate\n");
             }
@@ -685,15 +867,6 @@ int main(void)
         if (key_stable && watch_alarm_counting(&alarm))
             handled = true;
         watch_motor(watch_alarm_vibrate(&alarm, now), alarm.cfg->vib_pwm_duty);
-        rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
-        bool sent_sos = outbox(now);
-        rt_mutex_release(&store_mutex);
-        if (sample_ready) {
-            uint8_t frame[20];
-            watch_frame_imu(frame, seq++, now, &sample);
-            if (!sent_sos)
-                watch_ble_send(frame);
-        }
         uint32_t epoch;
         bool time_changed = watch_ble_time(&epoch);
         if (time_changed)
@@ -702,7 +875,7 @@ int main(void)
 
         if (manual_page && now - manual_since >= NOTICE_MS)
             manual_page = false;
-        const bool alarm_active = alarm.phase != ALARM_STATE_IDLE || manual_page;
+        const bool alarm_active = alarm.phase != ALARM_STATE_IDLE || manual_page || resolved_notice;
         if (!alarm_active && visible_page == PAGE_ALARM) {
             page = PAGE_DIAL;
             last_activity = now;
@@ -744,12 +917,25 @@ int main(void)
             power_reason = "idle";
         }
         enum watch_page next = alarm_active ? PAGE_ALARM : page;
-        if (time_changed || next != visible_page || now - last_draw >= 150u) {
+        if (time_changed || next != visible_page || was_holding != alarm.holding ||
+                now - last_draw >= (alarm.holding ? HOLD_DRAW_MS : 150u)) {
             last_draw = now;
             render(now, next, pin, power_reason);
         }
         if (title)
             lv_timer_handler();
+        rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
+        bool sent_sos = outbox(now);
+#ifdef WATCH_SOS_RESOLVED_UPLINK
+        sent_sos = sent_sos || send_resolution(now);
+#endif
+        rt_mutex_release(&store_mutex);
+        if (sample_ready) {
+            uint8_t frame[WATCH_FRAME_SIZE];
+            watch_frame_imu(frame, seq++, now, &sample);
+            if (!sent_sos)
+                watch_ble_send(frame);
+        }
         rt_uint32_t key_events;
         rt_event_recv(&key_wake, KEY2_EDGE_EVENT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
                       rt_tick_from_millisecond(WATCH_POLL_MS), &key_events);

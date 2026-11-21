@@ -2,6 +2,7 @@
 #include <rtthread.h>
 #include <string.h>
 #include "bf0_ble_gap.h"
+#include "bf0_ble_common.h"
 #include "bf0_sibles.h"
 #include "bf0_sibles_internal.h"
 #include "bf0_sibles_advertising.h"
@@ -221,11 +222,22 @@ bool watch_ble_send(uint8_t frame[WATCH_FRAME_SIZE])
     return sibles_write_value(conn, &data) == data.len;
 }
 
-bool watch_ble_ack(uint64_t *id, uint8_t *status)
+bool watch_ble_ack(uint8_t *type, uint64_t *id, uint8_t *status)
 {
     uint8_t frame[20];
     return acknowledgements && rt_mq_recv(acknowledgements, frame, sizeof(frame), 0) == RT_EOK &&
-           watch_frame_ack(frame, sizeof(frame), id, status);
+           watch_frame_ack(frame, sizeof(frame), type, id, status);
+}
+
+bool watch_ble_device_id(uint8_t id[WATCH_DEVICE_ID_SIZE])
+{
+    bd_addr_t address;
+    if (ble_get_public_address(&address) != 0)
+        return false;
+    /* BlueZ renders the SDK address array in reverse byte order. */
+    for (unsigned i = 0; i < WATCH_DEVICE_ID_SIZE; ++i)
+        id[i] = address.addr[WATCH_DEVICE_ID_SIZE - 1 - i];
+    return true;
 }
 
 bool watch_ble_time(uint32_t *local_epoch)

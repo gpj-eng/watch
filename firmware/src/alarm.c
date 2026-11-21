@@ -7,10 +7,13 @@ const alarm_cfg_t alarm_cfg_default = {
     .vib_normal_off_ms = 900u,
     .vib_urgent_on_ms = 500u,
     .vib_urgent_off_ms = 400u,
-    .sos_voice_interval_ms = 3000u,
-    .sos_voice_stop_hold_ms = 2000u,
+    .sos_vib_on_ms = 300u,
+    .sos_vib_off_ms = 700u,
+    .cancel_hold_ms = 3000u,
+    .sos_audio_max_ms = 0u,
     .vib_pwm_duty = 50u,
-    .sos_voice_repeat_max = 10u,
+    /* The prototype reset at the SDK maximum with the motor running on USB. */
+    .sos_audio_volume = 80u,
 };
 
 static uint32_t normal_phase_ms(const struct watch_alarm *alarm)
@@ -49,6 +52,8 @@ enum watch_alarm_event watch_alarm_update(struct watch_alarm *alarm, uint32_t no
     uint32_t elapsed = now - alarm->started_ms;
     if (elapsed >= alarm->cfg->cancel_timeout_ms) {
         alarm->phase = ALARM_STATE_SOS_ACTIVE;
+        alarm->sos_started_ms = now;
+        alarm->holding = false;
         return EVT_SOS_TIMEOUT;
     }
     if (cancel) {
@@ -62,22 +67,35 @@ enum watch_alarm_event watch_alarm_update(struct watch_alarm *alarm, uint32_t no
     return EVT_ALARM_NONE;
 }
 
-bool watch_alarm_finish_voice(struct watch_alarm *alarm, enum watch_alarm_event event)
+enum watch_alarm_event watch_alarm_hold(struct watch_alarm *alarm, bool pressed, bool new_press, uint32_t now)
 {
     if (alarm->phase != ALARM_STATE_SOS_ACTIVE)
-        return false;
-    if (event != EVT_SOS_VOICE_DONE && event != EVT_SOS_VOICE_STOPPED && event != EVT_SOS_VOICE_FAILED)
-        return false;
+        return EVT_ALARM_NONE;
+    if (!pressed) {
+        alarm->holding = false;
+        return EVT_ALARM_NONE;
+    }
+    if (new_press) {
+        alarm->hold_started_ms = now;
+        alarm->holding = true;
+    }
+    if (!alarm->holding || now - alarm->hold_started_ms < alarm->cfg->cancel_hold_ms)
+        return EVT_ALARM_NONE;
+    alarm->holding = false;
     alarm->phase = ALARM_STATE_IDLE;
-    return true;
+    return EVT_SOS_RESOLVED;
 }
 
 bool watch_alarm_vibrate(const struct watch_alarm *alarm, uint32_t now)
 {
+    const alarm_cfg_t *cfg = alarm->cfg;
+    if (alarm->phase == ALARM_STATE_SOS_ACTIVE) {
+        uint64_t period = (uint64_t)cfg->sos_vib_on_ms + cfg->sos_vib_off_ms;
+        return period && (now - alarm->sos_started_ms) % period < cfg->sos_vib_on_ms;
+    }
     if (!watch_alarm_counting(alarm))
         return false;
     uint32_t elapsed = now - alarm->started_ms;
-    const alarm_cfg_t *cfg = alarm->cfg;
     if (elapsed >= cfg->cancel_timeout_ms)
         return false;
     uint32_t normal = normal_phase_ms(alarm);

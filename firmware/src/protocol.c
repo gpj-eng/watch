@@ -50,9 +50,25 @@ bool watch_frame_sos(uint8_t out[20], const struct watch_sos *sos, uint8_t index
     return true;
 }
 
-bool watch_frame_ack(const uint8_t *frame, unsigned size, uint64_t *id, uint8_t *status)
+bool watch_frame_resolved(uint8_t out[WATCH_FRAME_SIZE], uint64_t id,
+                          const uint8_t device[WATCH_DEVICE_ID_SIZE], uint32_t ms)
 {
-    if (size != WATCH_FRAME_SIZE || frame[0] != 0x81 || frame[1] < 1 || frame[1] > 3)
+    static const uint8_t empty[WATCH_DEVICE_ID_SIZE];
+    if (!id || !memcmp(device, empty, sizeof(empty)))
+        return false;
+    out[0] = WATCH_RESOLVED_TYPE;
+    out[1] = WATCH_RESOLVED_BY_USER;
+    little_endian(out + 2, id, 8);
+    memcpy(out + 10, device, WATCH_DEVICE_ID_SIZE);
+    little_endian(out + 16, ms, 4);
+    return true;
+}
+
+bool watch_frame_ack(const uint8_t *frame, unsigned size, uint8_t *type, uint64_t *id, uint8_t *status)
+{
+    if (size != WATCH_FRAME_SIZE ||
+        (frame[0] != WATCH_SOS_ACK_TYPE && frame[0] != WATCH_RESOLVED_ACK_TYPE) ||
+        frame[1] < 1 || frame[1] > 3)
         return false;
     uint64_t event = 0;
     for (unsigned i = 0; i < 8; ++i)
@@ -62,6 +78,7 @@ bool watch_frame_ack(const uint8_t *frame, unsigned size, uint64_t *id, uint8_t 
             return false;
     if (!event)
         return false;
+    *type = frame[0];
     *id = event;
     *status = frame[1];
     return true;

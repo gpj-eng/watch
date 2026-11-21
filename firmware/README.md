@@ -2,9 +2,9 @@
 
 目标板为 `sf32lb52-lchspi-ulp`，基于 SiFli SDK v2.5.2 和 LVGL v9。一级表盘以 120 px 等宽布局显示 24 小时时钟，以 30 px 字体显示日期和星期。短按 KEY1 切到二级功能页，二级页提供长按求助。长按 KEY1 约 3 秒或手表静置约 15 秒进入息屏监测。抬腕、按键、疑似跌倒和手动 SOS 均可点亮屏幕。
 
-疑似跌倒确认后，马达和喇叭立即启动。马达的 1 kHz、50% PWM 在 10 秒后停止。喇叭间歇响铃至用户取消或 30 秒倒计时结束。在这 30 秒内按 KEY2 或点屏幕上的「我没事」会关闭声振并取消提交。倒计时结束后将 SOS 写入闪存队列，转发给 Jetson。待机时长按 KEY2 约 1.2 秒或长按屏幕按钮可直接提交手动 SOS。
+疑似跌倒确认后，马达和喇叭立即启动。马达使用 1 kHz、50% PWM，前 20 秒震 600 ms、停 900 ms，后 10 秒震 500 ms、停 400 ms。在这 30 秒内按 KEY2 或点屏幕上的「我没事」会关闭声振并取消提交。倒计时结束后，原 SOS 写入闪存队列并转发给 Jetson。手表同时切到震 300 ms、停 700 ms，并循环播放三连警报音和离线语音「我需要帮助」。按住 KEY2 3 秒解除，松手不足 3 秒会重置进度。解除后声振立即停止，屏幕提示约 2 秒后回到一级表盘。待机时长按 KEY2 约 1.2 秒或长按屏幕按钮可直接提交手动 SOS。
 
-时长由项目确认。设计比较了智能手表声音/触觉提醒的取消研究和 Apple Watch 的 30 秒跌倒倒计时。研究对象和场景与本项目不同。10 秒是本项目的马达提醒时长，30 秒是取消窗口，需要在目标用户试戴时测量按键或点击的实际完成时间。[取消窗口试点研究](https://pmc.ncbi.nlm.nih.gov/articles/PMC12835406/) · [Apple Watch 跌倒检测](https://support.apple.com/guide/watch/manage-fall-detection-apd34c409704/watchos)
+前 30 秒为误报取消窗口，仍需在目标用户试戴时测量按键或点击的实际完成时间。[取消窗口试点研究](https://pmc.ncbi.nlm.nih.gov/articles/PMC12835406/) · [Apple Watch 跌倒检测](https://support.apple.com/guide/watch/manage-fall-detection-apd34c409704/watchos)
 
 板载 LSM6DS3TR-C 按 52 Hz 配置。当前规则以冲击、方向变化和约 3 秒静止生成疑似跌倒事件。阈值只用于原型，应使用腕部样本量化漏报和误报。单独振动前先开片上 LDO3，再使能 PA20 的 PWM。手机号通过 FlashDB 存在板载 NOR 分区中，最多三位。BLE 使用带配对认证的加密链路，待发送事件持久化，重发沿用同一事件编号。短信由 Jetson 执行；「接收端已收」表示已入库，「短信服务已受理」表示提供商接收请求。
 
@@ -31,7 +31,15 @@ scons --board=sf32lb52-lchspi-ulp -j8
 1. 启动更新后的配对网关。Jetson 打印 `TIME_SYNC sent` 后，以手表串口的 `WATCH_TIME_SYNC source=ble rtc=ok flash=saved` 确认首次校时落盘。近期重复校时可以得到 `flash=unchanged` 或 `flash=deferred`。Jetson 以北京时间为手表校时。长时间使用时，手表每六小时保存一次有效时间检查点。
 2. 暂停网关，保持供电，执行五次 `reboot`。每次确认 `WATCH_TIME_BOOT source=rtc`、`WATCH_PAGE dial`，检查首屏日期、星期和时间。若 RTC 在某次重启后失效，应看到 `source=flash`，且仍显示有效时间。校时前的新环境若没有有效 RTC 和 Flash 记录，应看到 `source=build`，表盘小点提示尚未完成同步。
 3. 在纯 USB 和电池供电条件下分别记录 `WATCH_POWER`。短按 KEY1 两次，检查 `WATCH_KEY1 short`、`WATCH_PAGE function`、`WATCH_KEY1 short`、`WATCH_PAGE dial`。两页各确认一次求助按钮的位置。
-4. 长按 KEY1 约 3 秒后松手，检查 `WATCH_KEY1 long mode=monitor_sleep`、`WATCH_PAGE sleep`。短按可亮屏回表盘。重复息屏并输入 `watch_demo`，核对屏幕点亮、`WATCH_PAGE alarm`。报警期间按 KEY1 应记录 `WATCH_KEY1 ignored=alarm`。按 KEY2 取消，或等待本机报警流程结束，应回到 `WATCH_PAGE dial`。纯 USB 若长按无响应，记录 `vbus=1` 和按键实际表现。
+4. 长按 KEY1 约 3 秒后松手，检查 `WATCH_KEY1 long mode=monitor_sleep`、`WATCH_PAGE sleep`。短按可亮屏回表盘。重复息屏并输入 `watch_demo`，核对屏幕点亮、`WATCH_PAGE alarm`。报警期间按 KEY1 应记录 `WATCH_KEY1 ignored=alarm`。倒计时内按 KEY2 可取消并回到 `WATCH_PAGE dial`。纯 USB 若长按无响应，记录 `vbus=1` 和按键实际表现。
+
+## 超时报警与本机解除验收
+
+1. 接好喇叭，串口输入 `watch_demo` 做纯本机演练。等满 30 秒，查 `WATCH_SOS_TIMEOUT`、`WATCH_SOS_AUDIO … volume=12 pa42=1` 和 `WATCH_VIB` 边沿。听两轮三连警报音和「我需要帮助」，确认约 300 ms 震、700 ms 停。默认音量为 12/15 档，参数为 `alarm_cfg_default.sos_audio_volume`。
+2. 按 KEY2 约 1 秒后松手，确认圆圈隐藏，串口出现 `WATCH_KEY2_HOLD … state=reset`，声振继续。
+3. 再按住 KEY2 约 3 秒，确认满圈后立刻停声振，串口出现 `WATCH_SOS_AUDIO … muted pa42=0` 和 `WATCH_RESOLVED`，约 2 秒后回到 `WATCH_PAGE dial`。
+
+`watch_demo` 不提交 SOS。原 SOS 联调沿用 `watch_bench` 与保留的测试联系人。真实跌倒 SOS 的本机解除记录关联原 SOS 编号并单独保存。当前固件的 `WATCH_SOS_RESOLVED_UPLINK` 默认关闭，适合继续与旧网关联调。
 
 串口的 `show_date` 用于读出 RTC。硬件完全断电时，表盘从 Flash 保存的值恢复走时。断电期间的时间由 Jetson 在再次连接时校准。
 
