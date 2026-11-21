@@ -2,3 +2,12 @@ config CUSTOM_MEM_MAP
     bool
     select custom_mem_map
     default y
+
+config WATCH_SCREEN_TIMEOUT_MS
+    int "Watch screen timeout (milliseconds)"
+    range 1000 120000
+    default 15000
+
+config WATCH_DIAL_FACE_UP_NEGATIVE_Z
+    bool "Watch reports negative Z acceleration with the dial facing up"
+    default y

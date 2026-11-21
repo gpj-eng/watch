@@ -1,6 +1,6 @@
 # 黄山派老人求助手表固件
 
-目标板为 `sf32lb52-lchspi-ulp`，基于 SiFli SDK v2.5.2 和 LVGL v9。一级表盘显示日期、星期和 24 小时时钟。短按 KEY1 切到二级功能页，二级页提供长按求助。长按 KEY1 约 3 秒进入息屏监测，短按后返回表盘。疑似跌倒或手动 SOS 会点亮屏幕并抢占页面。
+目标板为 `sf32lb52-lchspi-ulp`，基于 SiFli SDK v2.5.2 和 LVGL v9。一级表盘以 120 px 等宽布局显示 24 小时时钟，以 30 px 字体显示日期和星期。短按 KEY1 切到二级功能页，二级页提供长按求助。长按 KEY1 约 3 秒或手表静置约 15 秒进入息屏监测。抬腕、按键、疑似跌倒和手动 SOS 均可点亮屏幕。
 
 疑似跌倒确认后，马达和喇叭立即启动。马达的 1 kHz、50% PWM 在 10 秒后停止。喇叭间歇响铃至用户取消或 30 秒倒计时结束。在这 30 秒内按 KEY2 或点屏幕上的「我没事」会关闭声振并取消提交。倒计时结束后将 SOS 写入闪存队列，转发给 Jetson。待机时长按 KEY2 约 1.2 秒或长按屏幕按钮可直接提交手动 SOS。
 
@@ -34,5 +34,12 @@ scons --board=sf32lb52-lchspi-ulp -j8
 4. 长按 KEY1 约 3 秒后松手，检查 `WATCH_KEY1 long mode=monitor_sleep`、`WATCH_PAGE sleep`。短按可亮屏回表盘。重复息屏并输入 `watch_demo`，核对屏幕点亮、`WATCH_PAGE alarm`。报警期间按 KEY1 应记录 `WATCH_KEY1 ignored=alarm`。按 KEY2 取消，或等待本机报警流程结束，应回到 `WATCH_PAGE dial`。纯 USB 若长按无响应，记录 `vbus=1` 和按键实际表现。
 
 串口的 `show_date` 用于读出 RTC。硬件完全断电时，表盘从 Flash 保存的值恢复走时。断电期间的时间由 Jetson 在再次连接时校准。
+
+## 大数字表盘与息屏验收
+
+- 一级表盘使用独立的 120 px Montserrat Bold 数字子集和 30 px Noto Sans SC 日期子集，背景由 LVGL 绘制双色垂直渐变。确认 `11:11` 和 `20:08` 均居中，一级页没有求助按钮。
+- `CONFIG_WATCH_SCREEN_TIMEOUT_MS` 位于 `firmware/project/proj.conf`，默认 15000。无按键操作，且合加速度在 0.90–1.10 g、合角速度不超过 12°/秒时开始计算静止时长。静置至黑屏后，串口应记录 `WATCH_DISPLAY sleep reason=idle`。用两次 `watch_status` 查看 `samples` 继续增长，已配对时同时查看 Jetson 持续接收六轴样本。
+- 屏幕朝上静放时，`watch_pose` 的 `face_up` 应接近正 1000 mg。现有配置按传感器负 Z 方向为朝上。抬腕应从表盘偏离朝上超过约 55° 开始，X/Y 合角速度连续两个样本达到 80°/秒。随后在 800 ms 内翻到朝上约 40° 以内，并满足 0.8–1.2 g、合角速度不超过 18°/秒连续八个样本。亮屏时应记录 `WATCH_DISPLAY wake reason=wrist` 和 `WATCH_PAGE dial`。用日常走路摆臂检查是否误亮。
+- 息屏将 AMOLED 亮度设为零并暂停 LVGL 重绘，触控供电保持开启。分别在息屏时按 KEY1 和 KEY2，应立即回到一级表盘。再次息屏，输入 `watch_demo`，确认 `WATCH_DISPLAY wake reason=alarm` 和 `WATCH_PAGE alarm`，短点屏幕上的「我没事」，确认 `WATCH_TOUCH cancel`、`WATCH_CANCELLED` 和 `WATCH_PAGE dial`。从表盘短按 KEY1 进入功能页，长按屏幕上的「长按求助」，确认 `WATCH_TOUCH manual`。这项验证使用未配置紧急联系人的测试表。
 
 中文字体为 SDK 附带的 Noto Sans SC 字形子集，许可见 `Font-OFL.txt`。构建脚手架来自 SiFli SDK BLE 外围设备示例。

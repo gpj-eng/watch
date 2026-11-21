@@ -1,5 +1,6 @@
 #include "watch_board.h"
 #include "watch_time.h"
+#include "watch_wrist.h"
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <finsh.h>
@@ -9,6 +10,8 @@
 #include <littlevgl2rtt.h>
 #include <lvgl.h>
 LV_FONT_DECLARE(watch_cjk);
+LV_FONT_DECLARE(watch_dial_date);
+LV_FONT_DECLARE(watch_dial_digits);
 
 #define KEY1 34
 #define KEY2 43
@@ -22,6 +25,8 @@ LV_FONT_DECLARE(watch_cjk);
 #define KEY2_DEBOUNCE_MS 30u
 #define KEY2_MANUAL_HOLD_MS 1200u
 #define WATCH_POLL_MS 4u
+#define IMU_ACTIVITY_GAP_MS 100u
+#define WATCH_PANEL_BRIGHTNESS 50u
 #define MAX_PENDING 4
 #define STORE_VERSION 0x48530201u
 
@@ -41,6 +46,7 @@ static struct watch_detector detector;
 static struct rt_event key_wake;
 static volatile uint32_t key_edge_ms;
 static volatile uint8_t demo_requested;
+static volatile bool pose_requested;
 static volatile uint32_t samples_read;
 static bool bench_alarm;
 static bool imu_ok, manual_requested, cancel_requested;
@@ -48,6 +54,7 @@ static uint32_t sensor_seen;
 enum watch_page { PAGE_NONE, PAGE_DIAL, PAGE_FUNCTION, PAGE_SLEEP, PAGE_ALARM };
 static enum watch_page visible_page;
 static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label, *sync_hint;
+static lv_obj_t *dial_date, *dial_digits[5];
 static rt_device_t lcd;
 static const char *notice;
 static uint32_t notice_started;
@@ -124,6 +131,12 @@ static void watch_demo(void)
     demo_requested = 1;
 }
 MSH_CMD_EXPORT(watch_demo, Run local alarm demo without sending SOS);
+
+static void watch_pose(void)
+{
+    pose_requested = true;
+}
+MSH_CMD_EXPORT(watch_pose, Print the next IMU sample and signed face-up acceleration);
 
 static void watch_bench(void)
 {
@@ -314,10 +327,14 @@ static bool outbox(uint32_t now)
 static void action_pressed(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (watch_alarm_counting(&alarm) && code == LV_EVENT_SHORT_CLICKED)
+    if (visible_page == PAGE_ALARM && watch_alarm_counting(&alarm) && code == LV_EVENT_SHORT_CLICKED) {
         cancel_requested = true;
-    if (visible_page == PAGE_FUNCTION && alarm.phase == ALARM_STATE_IDLE && code == LV_EVENT_LONG_PRESSED)
+        rt_kprintf("WATCH_TOUCH cancel\n");
+    }
+    if (visible_page == PAGE_FUNCTION && alarm.phase == ALARM_STATE_IDLE && code == LV_EVENT_LONG_PRESSED) {
         manual_requested = true;
+        rt_kprintf("WATCH_TOUCH manual\n");
+    }
 }
 
 static lv_obj_t *label(lv_obj_t *parent, int y, const lv_font_t *font, uint32_t color)
@@ -342,6 +359,24 @@ static void init_ui(void)
     lv_obj_remove_style_all(wallpaper);
     lv_obj_set_size(wallpaper, lv_pct(100), lv_pct(100));
     lv_obj_remove_flag(wallpaper, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(wallpaper, lv_color_hex(0x102038), 0);
+    lv_obj_set_style_bg_grad_color(wallpaper, lv_color_hex(0x2a3f5f), 0);
+    lv_obj_set_style_bg_grad_dir(wallpaper, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(wallpaper, LV_OPA_COVER, 0);
+    dial_date = label(wallpaper, 57, &watch_dial_date, 0xffffff);
+    lv_obj_t *clock_row = lv_obj_create(wallpaper);
+    lv_obj_remove_style_all(clock_row);
+    lv_obj_remove_flag(clock_row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(clock_row, 364, 200);
+    lv_obj_align(clock_row, LV_ALIGN_TOP_MID, 0, 105);
+    int x = 0;
+    for (unsigned i = 0; i < 5; ++i) {
+        const int width = i == 2 ? 32 : 83;
+        dial_digits[i] = label(clock_row, 0, &watch_dial_digits, 0xffffff);
+        lv_obj_set_width(dial_digits[i], width);
+        lv_obj_align(dial_digits[i], LV_ALIGN_LEFT_MID, x, 0);
+        x += width;
+    }
     const lv_font_t *font = &watch_cjk;
     title = label(screen, 63, font, 0xf3f8f4);
     reading = label(screen, 126, &lv_font_montserrat_48, 0xffffff);
@@ -378,7 +413,7 @@ static void set_visible(lv_obj_t *object, bool visible)
         lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
+static bool update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
 {
     static bool initialized, raw, stable, consumed, vbus;
     static uint32_t changed, down_since, power_changed;
@@ -390,7 +425,7 @@ static void update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
         vbus = usb;
         changed = down_since = power_changed = now;
         rt_kprintf("WATCH_POWER vbus=%d battery=%s\n", usb, usb ? "unknown" : "only");
-        return;
+        return false;
     }
 
     if (usb != vbus) {
@@ -407,11 +442,17 @@ static void update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
         consumed = true;
         rt_kprintf("WATCH_KEY1 ignored=alarm\n");
     }
+    bool activity = false;
     if (stable != raw && now - changed >= KEY1_DEBOUNCE_MS) {
         stable = raw;
         if (stable) {
             down_since = changed;
             consumed |= now - power_changed < KEY1_POWER_GUARD_MS;
+            activity = !consumed;
+            if (!consumed && *page == PAGE_SLEEP) {
+                *page = PAGE_DIAL;
+                consumed = true;
+            }
         } else {
             uint32_t held = changed - down_since;
             if (!consumed && held < KEY1_SHORT_MS) {
@@ -431,9 +472,10 @@ static void update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
                        vbus, vbus ? "unknown" : "only");
         }
     }
+    return activity;
 }
 
-static void render(uint32_t now, enum watch_page next, unsigned pin)
+static void render(uint32_t now, enum watch_page next, unsigned pin, const char *power_reason)
 {
     if (!title)
         return;
@@ -445,13 +487,25 @@ static void render(uint32_t now, enum watch_page next, unsigned pin)
             [PAGE_SLEEP] = "sleep", [PAGE_ALARM] = "alarm",
         };
         if (visible_page == PAGE_SLEEP || next == PAGE_SLEEP) {
-            int command = next == PAGE_SLEEP ? RTGRAPHIC_CTRL_POWEROFF : RTGRAPHIC_CTRL_POWERON;
-            if (!lcd || rt_device_control(lcd, command, NULL) != RT_EOK) {
-                rt_kprintf("WATCH_DISPLAY power=%s error\n", next == PAGE_SLEEP ? "off" : "on");
+            /* Board-level LCD power-off also cuts the touchscreen's shared 3.3 V rail. */
+            uint8_t brightness = next == PAGE_SLEEP ? 0 : WATCH_PANEL_BRIGHTNESS;
+            if (!lcd || rt_device_control(lcd, RTGRAPHIC_CTRL_SET_BRIGHTNESS, &brightness) != RT_EOK) {
+                rt_kprintf("WATCH_DISPLAY brightness=%u error\n", (unsigned)brightness);
                 return;
             }
-            if (next != PAGE_SLEEP)
+            if (next == PAGE_SLEEP) {
+                lv_display_enable_invalidation(NULL, false);
+                lv_timer_pause(lv_display_get_refr_timer(NULL));
+                set_visible(action, false);
+            } else {
+                lv_display_enable_invalidation(NULL, true);
                 lv_obj_invalidate(screen);
+            }
+            rt_kprintf("WATCH_DISPLAY %s reason=%s\n", next == PAGE_SLEEP ? "sleep" : "wake", power_reason);
+        }
+        if (alarm_page) {
+            /* A touch that began before the alarm must be released before it can cancel it. */
+            lv_indev_wait_release(lv_indev_get_next(NULL));
         }
         visible_page = next;
         rt_kprintf("WATCH_PAGE %s\n", names[next]);
@@ -459,9 +513,11 @@ static void render(uint32_t now, enum watch_page next, unsigned pin)
             return;
         lv_obj_set_style_bg_color(screen, lv_color_hex(alarm_page ? 0x381b1c : 0x111919), 0);
         lv_obj_set_style_text_color(reading, lv_color_hex(alarm_page ? 0xffcb91 : 0xffffff), 0);
-        lv_obj_set_style_text_font(title, next == PAGE_DIAL ? &lv_font_montserrat_14 : &watch_cjk, 0);
         lv_obj_set_style_bg_color(action, lv_color_hex(alarm_page ? 0x286354 : 0xa73732), 0);
         set_visible(wallpaper, next == PAGE_DIAL);
+        set_visible(title, next != PAGE_DIAL);
+        set_visible(reading, next != PAGE_DIAL);
+        set_visible(caption, next != PAGE_DIAL);
     } else if (next == PAGE_SLEEP) {
         return;
     }
@@ -494,17 +550,18 @@ static void render(uint32_t now, enum watch_page next, unsigned pin)
                                   notifying ? notice : "");
         }
     } else {
-        static const char *const weekdays[] = {
-            "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六",
-        };
+        static const char *const weekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
         struct tm local;
-        char date[11], time[6];
+        char date[32], time[6];
         if (watch_time_calendar(now, &local)) {
-            strftime(date, sizeof(date), "%Y-%m-%d", &local);
-            strftime(time, sizeof(time), "%H:%M", &local);
-            update_label(title, date);
-            update_label(reading, time);
-            update_label(caption, weekdays[local.tm_wday]);
+            rt_snprintf(date, sizeof(date), "%d月%d日 周%s", local.tm_mon + 1,
+                        local.tm_mday, weekdays[local.tm_wday]);
+            rt_snprintf(time, sizeof(time), "%02d:%02d", local.tm_hour, local.tm_min);
+            update_label(dial_date, date);
+            for (unsigned i = 0; i < 5; ++i) {
+                const char digit[] = {time[i], '\0'};
+                update_label(dial_digits[i], digit);
+            }
         }
     }
 }
@@ -535,6 +592,9 @@ int main(void)
     bool manual_page = false;
     uint32_t manual_since = 0;
     unsigned last_pin = 1000000u;
+    struct watch_wrist wrist = {0};
+    uint32_t last_activity = watch_now_ms();
+    const char *power_reason = "startup";
     while (true) {
         watch_ble_poll();
         rt_base_t level = rt_hw_interrupt_disable();
@@ -560,9 +620,11 @@ int main(void)
             key_raw = pressed;
             key_changed = key_irq_ready ? edge_ms : now;
         }
+        bool key2_activity = false;
         if (key_stable != key_raw && now - key_changed >= KEY2_DEBOUNCE_MS) {
             key_stable = key_raw;
             if (key_stable) {
+                key2_activity = true;
                 down_since = key_changed + KEY2_DEBOUNCE_MS;
                 handled = watch_alarm_counting(&alarm);
                 pressed_in_sos = alarm.phase == ALARM_STATE_SOS_ACTIVE;
@@ -606,9 +668,15 @@ int main(void)
 
         struct watch_imu sample;
         bool sample_ready = imu_ok && watch_imu_read(&sample);
+        const bool recent_sample = samples_read != 0 && now - sensor_seen <= IMU_ACTIVITY_GAP_MS;
         if (sample_ready) {
             ++samples_read;
             sensor_seen = now;
+            if (pose_requested) {
+                pose_requested = false;
+                rt_kprintf("WATCH_POSE ax=%d ay=%d az=%d face_up=%d mg\n",
+                           sample.ax, sample.ay, sample.az, (int)watch_wrist_face_up_mg(&sample));
+            }
             if (alarm.phase == ALARM_STATE_IDLE && watch_detect(&detector, &sample, now)) {
                 start_countdown(now, false);
                 rt_kprintf("WATCH_FALL candidate\n");
@@ -635,19 +703,52 @@ int main(void)
         if (manual_page && now - manual_since >= NOTICE_MS)
             manual_page = false;
         const bool alarm_active = alarm.phase != ALARM_STATE_IDLE || manual_page;
-        if (!alarm_active && visible_page == PAGE_ALARM)
+        if (!alarm_active && visible_page == PAGE_ALARM) {
             page = PAGE_DIAL;
-        update_key1(&page, alarm_active || visible_page == PAGE_ALARM, now);
+            last_activity = now;
+        }
+        const enum watch_page from = page;
+        const bool key1_activity = update_key1(&page, alarm_active || visible_page == PAGE_ALARM, now);
+        if (alarm_active) {
+            last_activity = now;
+            power_reason = "alarm";
+        } else if (from == PAGE_SLEEP && page == PAGE_DIAL) {
+            power_reason = "key1";
+            last_activity = now;
+        } else if (page == PAGE_SLEEP && key2_activity) {
+            page = PAGE_DIAL;
+            power_reason = "key2";
+            last_activity = now;
+        } else if (from == PAGE_SLEEP && sample_ready && watch_wrist_update(&wrist, &sample, now)) {
+            page = PAGE_DIAL;
+            power_reason = "wrist";
+            last_activity = now;
+        } else if (from != PAGE_SLEEP && page == PAGE_SLEEP) {
+            power_reason = "key1";
+        }
+
+        if (page != PAGE_SLEEP) {
+            wrist = (struct watch_wrist){0};
+            if (key1_activity || key2_activity || (sample_ready && (!recent_sample || !watch_wrist_still(&sample))))
+                last_activity = now;
+        }
         unsigned pin = watch_ble_pin();
-        if (pin != last_pin && pin < 1000000u && !alarm_active && page != PAGE_SLEEP)
+        if (pin != last_pin && pin < 1000000u && !alarm_active && page != PAGE_SLEEP) {
             page = PAGE_FUNCTION;
+            last_activity = now;
+        }
         last_pin = pin;
+        if (title && page != PAGE_SLEEP && !alarm_active && sample_ready && now - last_activity >= WATCH_SCREEN_TIMEOUT_MS &&
+                lv_display_get_inactive_time(NULL) >= WATCH_SCREEN_TIMEOUT_MS) {
+            page = PAGE_SLEEP;
+            power_reason = "idle";
+        }
         enum watch_page next = alarm_active ? PAGE_ALARM : page;
         if (time_changed || next != visible_page || now - last_draw >= 150u) {
             last_draw = now;
-            render(now, next, pin);
+            render(now, next, pin, power_reason);
         }
-        if (title && visible_page != PAGE_SLEEP)
+        if (title)
             lv_timer_handler();
         rt_uint32_t key_events;
         rt_event_recv(&key_wake, KEY2_EDGE_EVENT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
