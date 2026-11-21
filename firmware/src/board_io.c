@@ -2,9 +2,12 @@
 #include <board.h>
 #include <rtdevice.h>
 #include "bf0_hal.h"
-#include "audio_server.h"
 #include "drivers/rt_drv_pwm.h"
-#include <math.h>
+
+#ifndef WATCH_LOG_VIB_EDGES
+#define WATCH_LOG_VIB_EDGES 1
+#endif
+#define WATCH_VIB_PWM_PERIOD_NS 1000000u
 
 static struct rt_i2c_bus_device *imu_bus;
 static uint16_t imu_addr;
@@ -62,10 +65,11 @@ bool watch_imu_read(struct watch_imu *sample)
     return true;
 }
 
-void watch_motor(bool on)
+void watch_motor(bool on, uint8_t duty)
 {
     static bool requested, running, owns_rail;
     static struct rt_device_pwm *pwm;
+    on = on && duty != 0;
     if (on == requested)
         return;
     requested = on;
@@ -81,76 +85,24 @@ void watch_motor(bool on)
             return;
         }
         HAL_PIN_Set(PAD_PA20, GPTIM1_CH2, PIN_NOPULL, 1);
-        if (rt_pwm_set(pwm, 2, 1000000u, 500000u) != RT_EOK || rt_pwm_enable(pwm, 2) != RT_EOK) {
+        uint32_t pulse = WATCH_VIB_PWM_PERIOD_NS * (duty > 100u ? 100u : duty) / 100u;
+        if (rt_pwm_set(pwm, 2, WATCH_VIB_PWM_PERIOD_NS, pulse) != RT_EOK || rt_pwm_enable(pwm, 2) != RT_EOK) {
             HAL_PIN_Set(PAD_PA20, GPIO_A20, PIN_PULLDOWN, 1);
             if (owns_rail)
                 HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, false, false);
             rt_kprintf("WATCH_VIB pwm enable failed\n");
             return;
         }
-        rt_kprintf("WATCH_VIB on ms=%u\n", (unsigned)watch_now_ms());
+        if (WATCH_LOG_VIB_EDGES)
+            rt_kprintf("WATCH_VIB on ms=%u\n", (unsigned)watch_now_ms());
     } else if (running) {
         rt_pwm_disable(pwm, 2);
         HAL_PIN_Set(PAD_PA20, GPIO_A20, PIN_PULLDOWN, 1);
         rt_pin_mode(20, PIN_MODE_INPUT_PULLDOWN);
         if (owns_rail)
             HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, false, false);
-        rt_kprintf("WATCH_VIB off ms=%u\n", (unsigned)watch_now_ms());
+        if (WATCH_LOG_VIB_EDGES)
+            rt_kprintf("WATCH_VIB off ms=%u\n", (unsigned)watch_now_ms());
     }
     running = on;
-}
-
-static volatile bool audio_enabled;
-static int16_t pcm[160];
-
-static void audio_thread(void *unused)
-{
-    (void)unused;
-    audio_client_t client = NULL;
-    audio_parameter_t params = {
-        .write_samplerate = 16000, .write_cache_size = 1280,
-        .write_channnel_num = 1, .write_bits_per_sample = 16,
-    };
-    unsigned block = 0;
-    while (true) {
-        if (!audio_enabled) {
-            if (client) {
-                audio_close(client);
-                client = NULL;
-            }
-            block = 0;
-            rt_thread_mdelay(10);
-            continue;
-        }
-        if (!client) {
-            client = audio_open(AUDIO_TYPE_ALARM, AUDIO_TX, &params, NULL, NULL);
-            if (!client) {
-                rt_thread_mdelay(500);
-                continue;
-            }
-        }
-        unsigned part = block % 100;
-        for (unsigned i = 0; i < 160; ++i) {
-            unsigned t = part * 160 + i;
-            float f = part < 20 ? 800.0f : 1000.0f;
-            pcm[i] = part < 40 ? (int16_t)(5500.0f * sinf(6.2831853f * f * t / 16000.0f)) : 0;
-        }
-        int n = audio_write(client, (uint8_t *)pcm, sizeof(pcm));
-        if (n == sizeof(pcm))
-            ++block;
-        else
-            rt_thread_mdelay(5);
-    }
-}
-
-void watch_audio_init(void)
-{
-    rt_thread_t thread = rt_thread_create("alarmspk", audio_thread, NULL, 3072, 22, 10);
-    if (thread)
-        rt_thread_startup(thread);
-}
-
-void watch_audio(bool on)
-{
-    audio_enabled = on;
 }

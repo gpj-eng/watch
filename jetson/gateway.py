@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from protocol import ACK_FRAME, ProtocolError, RX_UUID, SERVICE_UUID, TX_UUID
+from protocol import ACK_FRAME, ProtocolError, RX_UUID, SERVICE_UUID, TX_UUID, time_sync
 from receiver import EventStore, Receiver
 
 LOG = logging.getLogger("hspi")
@@ -195,6 +195,13 @@ class BleGateway:
         try:
             tx.StartNotify(timeout=5)
             LOG.info("Subscribed to HSPI-SOS on %s (%s)", self.config.watch, self.config.adapter)
+            if not self.config.bench_unpaired:
+                try:
+                    rx.WriteValue(self.dbus.ByteArray(time_sync(int(time.time()))),
+                                  self.dbus.Dictionary({}, signature="sv"), timeout=3)
+                    LOG.info("TIME_SYNC sent to %s", self.config.watch)
+                except (self.dbus.DBusException, ValueError) as exc:
+                    LOG.warning("TIME_SYNC unavailable: %s", exc)
             loop.run()
         finally:
             if self.ack_in_flight is not None:

@@ -1,16 +1,27 @@
 #include "watch_board.h"
+#include "watch_time.h"
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <finsh.h>
 #include <flashdb.h>
 #include <fal.h>
 #include <string.h>
-#include <time.h>
 #include <littlevgl2rtt.h>
 #include <lvgl.h>
 LV_FONT_DECLARE(watch_cjk);
 
+#define KEY1 34
 #define KEY2 43
+#define VBUS_DET 44
+#define KEY1_DEBOUNCE_MS 30u
+#define KEY1_SHORT_MS 500u
+#define KEY1_LONG_MS 3000u
+#define KEY1_POWER_GUARD_MS 300u
+#define NOTICE_MS 12000u
+#define KEY2_EDGE_EVENT (1u << 0)
+#define KEY2_DEBOUNCE_MS 30u
+#define KEY2_MANUAL_HOLD_MS 1200u
+#define WATCH_POLL_MS 4u
 #define MAX_PENDING 4
 #define STORE_VERSION 0x48530201u
 
@@ -24,15 +35,20 @@ struct persisted {
 static struct persisted stored = {.version = STORE_VERSION};
 static struct fdb_kvdb database;
 static struct rt_mutex store_mutex;
-static bool store_ok;
-static struct watch_alarm alarm;
+static bool store_ok, database_ready;
+static struct watch_alarm alarm = {.cfg = &alarm_cfg_default};
 static struct watch_detector detector;
+static struct rt_event key_wake;
+static volatile uint32_t key_edge_ms;
 static volatile uint8_t demo_requested;
 static volatile uint32_t samples_read;
 static bool bench_alarm;
 static bool imu_ok, manual_requested, cancel_requested;
 static uint32_t sensor_seen;
-static lv_obj_t *screen, *title, *reading, *caption, *action, *action_label;
+enum watch_page { PAGE_NONE, PAGE_DIAL, PAGE_FUNCTION, PAGE_SLEEP, PAGE_ALARM };
+static enum watch_page visible_page;
+static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label, *sync_hint;
+static rt_device_t lcd;
 static const char *notice;
 static uint32_t notice_started;
 
@@ -40,6 +56,13 @@ uint32_t watch_now_ms(void)
 {
     /* Keep elapsed arithmetic valid even when the RTOS tick wraps. */
     return (uint32_t)((uint64_t)rt_tick_get() * 1000u / RT_TICK_PER_SECOND);
+}
+
+static void key2_edge(void *argument)
+{
+    (void)argument;
+    key_edge_ms = watch_now_ms();
+    rt_event_send(&key_wake, KEY2_EDGE_EVENT);
 }
 
 static bool save(const struct persisted *next)
@@ -53,7 +76,9 @@ static void load_store(void)
     struct persisted loaded = {0};
     struct fdb_blob blob;
     rt_mutex_init(&store_mutex, "sosdb", RT_IPC_FLAG_PRIO);
-    store_ok = fal_init() >= 0 && fdb_kvdb_init(&database, "watch", "watch_sos", NULL, NULL) == FDB_NO_ERR;
+    database_ready = fal_init() >= 0 &&
+                     fdb_kvdb_init(&database, "watch", "watch_sos", NULL, NULL) == FDB_NO_ERR;
+    store_ok = database_ready;
     if (store_ok) {
         size_t length = fdb_kv_get_blob(&database, "state", fdb_blob_make(&blob, &loaded, sizeof(loaded)));
         if (length == sizeof(loaded) && loaded.version == STORE_VERSION)
@@ -135,11 +160,8 @@ static void show_notice(const char *message, uint32_t now)
 
 static void submit(uint32_t now)
 {
-    if (alarm.demo) {
-        show_notice("演示结束", now);
-        rt_kprintf("WATCH_DEMO_END\n");
+    if (alarm.demo)
         return;
-    }
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
     struct persisted next = stored;
     unsigned slot = 0;
@@ -175,6 +197,45 @@ static void submit(uint32_t now)
         }
     }
     rt_mutex_release(&store_mutex);
+}
+
+static void start_countdown(uint32_t now, bool demo)
+{
+    watch_alarm_fall(&alarm, now, demo);
+    watch_voice_set(WATCH_VOICE_TONE);
+    rt_kprintf("WATCH_ALARM_COUNTDOWN ms=%u phase=NORMAL total_ms=%u\n",
+               (unsigned)now, (unsigned)alarm.cfg->cancel_timeout_ms);
+}
+
+static void handle_alarm_event(enum watch_alarm_event event, uint32_t now)
+{
+    switch (event) {
+    case EVT_ALARM_URGENT:
+        rt_kprintf("WATCH_ALARM_PHASE ms=%u from=NORMAL to=URGENT\n", (unsigned)now);
+        break;
+    case EVT_ALARM_CANCEL:
+        watch_motor(false, alarm.cfg->vib_pwm_duty);
+        watch_voice_set(WATCH_VOICE_OFF);
+        show_notice("已取消", now);
+        rt_kprintf("WATCH_CANCELLED ms=%u event=EVT_ALARM_CANCEL\n", (unsigned)now);
+        bench_alarm = false;
+        detector = (struct watch_detector){0};
+        break;
+    case EVT_SOS_TIMEOUT:
+        watch_motor(false, alarm.cfg->vib_pwm_duty);
+        rt_kprintf("WATCH_SOS_TIMEOUT ms=%u event=EVT_SOS_TIMEOUT\n", (unsigned)now);
+        watch_voice_set(WATCH_VOICE_HELP);
+        submit(now);
+        bench_alarm = false;
+        break;
+    case EVT_SOS_MANUAL:
+        bench_alarm = false;
+        submit(now);
+        detector = (struct watch_detector){0};
+        break;
+    default:
+        break;
+    }
 }
 
 static bool outbox(uint32_t now)
@@ -253,9 +314,9 @@ static bool outbox(uint32_t now)
 static void action_pressed(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (alarm.phase == WATCH_COUNTDOWN && code == LV_EVENT_SHORT_CLICKED)
+    if (watch_alarm_counting(&alarm) && code == LV_EVENT_SHORT_CLICKED)
         cancel_requested = true;
-    if (alarm.phase == WATCH_IDLE && code == LV_EVENT_LONG_PRESSED)
+    if (visible_page == PAGE_FUNCTION && alarm.phase == ALARM_STATE_IDLE && code == LV_EVENT_LONG_PRESSED)
         manual_requested = true;
 }
 
@@ -274,8 +335,13 @@ static void init_ui(void)
 {
     if (littlevgl2rtt_init("lcd") != RT_EOK)
         return;
+    lcd = rt_device_find("lcd");
     screen = lv_screen_active();
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    wallpaper = lv_obj_create(screen);
+    lv_obj_remove_style_all(wallpaper);
+    lv_obj_set_size(wallpaper, lv_pct(100), lv_pct(100));
+    lv_obj_remove_flag(wallpaper, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     const lv_font_t *font = &watch_cjk;
     title = label(screen, 63, font, 0xf3f8f4);
     reading = label(screen, 126, &lv_font_montserrat_48, 0xffffff);
@@ -288,9 +354,15 @@ static void init_ui(void)
     action_label = label(action, 0, font, 0xffffff);
     lv_obj_set_width(action_label, 270);
     lv_obj_center(action_label);
+    sync_hint = lv_obj_create(screen);
+    lv_obj_remove_style_all(sync_hint);
+    lv_obj_remove_flag(sync_hint, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(sync_hint, 7, 7);
+    lv_obj_align(sync_hint, LV_ALIGN_TOP_RIGHT, -37, 45);
+    lv_obj_set_style_radius(sync_hint, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(sync_hint, lv_color_hex(0xffcb91), 0);
+    lv_obj_set_style_bg_opa(sync_hint, LV_OPA_COVER, 0);
 }
-
-enum watch_view { VIEW_NONE, VIEW_CLOCK, VIEW_FALL, VIEW_DEMO, VIEW_GESTURE, VIEW_PAIR };
 
 static void update_label(lv_obj_t *object, const char *text)
 {
@@ -298,146 +370,253 @@ static void update_label(lv_obj_t *object, const char *text)
         lv_label_set_text(object, text);
 }
 
-static void render(uint32_t now)
+static void set_visible(lv_obj_t *object, bool visible)
+{
+    if (visible && lv_obj_has_flag(object, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN);
+    else if (!visible && !lv_obj_has_flag(object, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
+{
+    static bool initialized, raw, stable, consumed, vbus;
+    static uint32_t changed, down_since, power_changed;
+    const bool pressed = rt_pin_read(KEY1) == PIN_HIGH;
+    const bool usb = rt_pin_read(VBUS_DET) == PIN_HIGH;
+    if (!initialized) {
+        initialized = true;
+        raw = stable = consumed = pressed;
+        vbus = usb;
+        changed = down_since = power_changed = now;
+        rt_kprintf("WATCH_POWER vbus=%d battery=%s\n", usb, usb ? "unknown" : "only");
+        return;
+    }
+
+    if (usb != vbus) {
+        vbus = usb;
+        power_changed = now;
+        consumed |= raw || stable || pressed;
+        rt_kprintf("WATCH_POWER vbus=%d battery=%s\n", usb, usb ? "unknown" : "only");
+    }
+    if (raw != pressed) {
+        raw = pressed;
+        changed = now;
+    }
+    if (alarm_active && (stable || raw) && !consumed) {
+        consumed = true;
+        rt_kprintf("WATCH_KEY1 ignored=alarm\n");
+    }
+    if (stable != raw && now - changed >= KEY1_DEBOUNCE_MS) {
+        stable = raw;
+        if (stable) {
+            down_since = changed;
+            consumed |= now - power_changed < KEY1_POWER_GUARD_MS;
+        } else {
+            uint32_t held = changed - down_since;
+            if (!consumed && held < KEY1_SHORT_MS) {
+                *page = *page == PAGE_DIAL ? PAGE_FUNCTION : PAGE_DIAL;
+                rt_kprintf("WATCH_KEY1 short ms=%u\n", (unsigned)held);
+            }
+            consumed = false;
+        }
+    } else if (!stable && !raw && now - changed >= KEY1_DEBOUNCE_MS) {
+        consumed = false;
+    }
+    if (stable && raw && !consumed && now - down_since >= KEY1_LONG_MS) {
+        consumed = true;
+        if (*page != PAGE_SLEEP) {
+            *page = PAGE_SLEEP;
+            rt_kprintf("WATCH_KEY1 long mode=monitor_sleep vbus=%d battery=%s\n",
+                       vbus, vbus ? "unknown" : "only");
+        }
+    }
+}
+
+static void render(uint32_t now, enum watch_page next, unsigned pin)
 {
     if (!title)
         return;
-    static enum watch_view view;
-    static uint32_t last_clock_read;
-    static char clock_date[11], clock_time[6];
-    const bool active = alarm.phase == WATCH_COUNTDOWN;
-    unsigned pin = watch_ble_pin();
-    enum watch_view next = VIEW_CLOCK;
-    if (active)
-        next = alarm.demo || bench_alarm ? VIEW_DEMO : alarm.reason == WATCH_FALL ? VIEW_FALL : VIEW_GESTURE;
-    else if (pin < 1000000u)
-        next = VIEW_PAIR;
-
-    if (next == VIEW_CLOCK && (view != next || now - last_clock_read >= 1000u)) {
-        time_t stamp = time(NULL);
-        struct tm local;
-        if (localtime_r(&stamp, &local) && local.tm_year >= 120) {
-            strftime(clock_date, sizeof(clock_date), "%Y-%m-%d", &local);
-            strftime(clock_time, sizeof(clock_time), "%H:%M", &local);
-        } else {
-            clock_date[0] = '\0';
-            strcpy(clock_time, "--:--");
-        }
-        last_clock_read = now;
-    }
-
-    if (view != next) {
+    const bool alarm_page = next == PAGE_ALARM;
+    const bool counting = alarm_page && watch_alarm_counting(&alarm);
+    if (visible_page != next) {
         static const char *const names[] = {
-            [VIEW_CLOCK] = "clock", [VIEW_FALL] = "fall", [VIEW_DEMO] = "demo",
-            [VIEW_GESTURE] = "gesture", [VIEW_PAIR] = "pair",
+            [PAGE_DIAL] = "dial", [PAGE_FUNCTION] = "function",
+            [PAGE_SLEEP] = "sleep", [PAGE_ALARM] = "alarm",
         };
-        lv_obj_set_style_bg_color(screen, lv_color_hex(active ? 0x381b1c : 0x111919), 0);
-        lv_obj_set_style_text_color(reading, lv_color_hex(active ? 0xffcb91 : 0xffffff), 0);
-        lv_obj_set_style_text_font(title, next == VIEW_CLOCK ? &lv_font_montserrat_14 : &watch_cjk, 0);
-        lv_obj_set_style_bg_color(action, lv_color_hex(active ? 0x286354 : 0xa73732), 0);
-        update_label(action_label, active ? "我没事" : "长按求助");
-        rt_kprintf("WATCH_SCREEN %s\n", names[next]);
-        view = next;
+        if (visible_page == PAGE_SLEEP || next == PAGE_SLEEP) {
+            int command = next == PAGE_SLEEP ? RTGRAPHIC_CTRL_POWEROFF : RTGRAPHIC_CTRL_POWERON;
+            if (!lcd || rt_device_control(lcd, command, NULL) != RT_EOK) {
+                rt_kprintf("WATCH_DISPLAY power=%s error\n", next == PAGE_SLEEP ? "off" : "on");
+                return;
+            }
+            if (next != PAGE_SLEEP)
+                lv_obj_invalidate(screen);
+        }
+        visible_page = next;
+        rt_kprintf("WATCH_PAGE %s\n", names[next]);
+        if (next == PAGE_SLEEP)
+            return;
+        lv_obj_set_style_bg_color(screen, lv_color_hex(alarm_page ? 0x381b1c : 0x111919), 0);
+        lv_obj_set_style_text_color(reading, lv_color_hex(alarm_page ? 0xffcb91 : 0xffffff), 0);
+        lv_obj_set_style_text_font(title, next == PAGE_DIAL ? &lv_font_montserrat_14 : &watch_cjk, 0);
+        lv_obj_set_style_bg_color(action, lv_color_hex(alarm_page ? 0x286354 : 0xa73732), 0);
+        set_visible(wallpaper, next == PAGE_DIAL);
+    } else if (next == PAGE_SLEEP) {
+        return;
     }
 
+    set_visible(action, next == PAGE_FUNCTION || counting);
+    set_visible(sync_hint, next == PAGE_DIAL && !watch_time_is_synced());
     char value[8];
-    if (active) {
+    const bool notifying = notice && now - notice_started < NOTICE_MS;
+    if (counting) {
         rt_snprintf(value, sizeof(value), "%02u", watch_alarm_seconds(&alarm, now));
-        update_label(title, next == VIEW_FALL ? "疑似跌倒" : next == VIEW_GESTURE ? "手势求助" : "演示提醒");
+        update_label(title, alarm.demo || bench_alarm ? "演示提醒" : "疑似跌倒");
         update_label(reading, value);
         update_label(caption, alarm.demo ? "演示不会发送短信" : "短按取消");
-    } else if (next == VIEW_PAIR) {
-        rt_snprintf(value, sizeof(value), "%06u", pin);
-        update_label(title, "蓝牙配对");
-        update_label(reading, value);
-        update_label(caption, "请在接收端输入");
+        update_label(action_label, "我没事");
+    } else if (alarm_page) {
+        update_label(title, alarm.demo ? "演示提醒" : "求助");
+        update_label(reading, "SOS");
+        update_label(caption, alarm.demo ? "演示不会发送短信" : notifying ? notice : "");
+    } else if (next == PAGE_FUNCTION) {
+        update_label(action_label, "长按求助");
+        if (pin < 1000000u) {
+            rt_snprintf(value, sizeof(value), "%06u", pin);
+            update_label(title, "蓝牙配对");
+            update_label(reading, value);
+            update_label(caption, "请在接收端输入");
+        } else {
+            update_label(title, "安全手表");
+            update_label(reading, "");
+            update_label(caption, !imu_ok || now - sensor_seen > 500u ? "传感器异常" :
+                                  notifying ? notice : "");
+        }
     } else {
-        const char *status = "";
-        if (!imu_ok || now - sensor_seen > 500u)
-            status = "传感器异常";
-        else if (notice && now - notice_started < 12000u)
-            status = notice;
-        else if (!clock_date[0])
-            status = "待设置";
-        update_label(title, clock_date);
-        update_label(reading, clock_time);
-        update_label(caption, status);
+        static const char *const weekdays[] = {
+            "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六",
+        };
+        struct tm local;
+        char date[11], time[6];
+        if (watch_time_calendar(now, &local)) {
+            strftime(date, sizeof(date), "%Y-%m-%d", &local);
+            strftime(time, sizeof(time), "%H:%M", &local);
+            update_label(title, date);
+            update_label(reading, time);
+            update_label(caption, weekdays[local.tm_wday]);
+        }
     }
 }
 
 int main(void)
 {
     load_store();
+    watch_time_init(database_ready ? &database : NULL, &store_mutex, watch_now_ms());
+    rt_pin_mode(KEY1, PIN_MODE_INPUT_PULLDOWN);
+    rt_pin_mode(VBUS_DET, PIN_MODE_INPUT);
     rt_pin_mode(KEY2, PIN_MODE_INPUT_PULLDOWN);
+    rt_event_init(&key_wake, "key2", RT_IPC_FLAG_PRIO);
+    key_edge_ms = watch_now_ms();
+    bool key_irq_ready = rt_pin_attach_irq(KEY2, PIN_IRQ_MODE_RISING_FALLING, key2_edge, NULL) == RT_EOK &&
+                         rt_pin_irq_enable(KEY2, PIN_IRQ_ENABLE) == RT_EOK;
+    if (!key_irq_ready)
+        rt_kprintf("WATCH_KEY2 ms=%u irq_unavailable polling\n", (unsigned)watch_now_ms());
     imu_ok = watch_imu_init() == 0;
-    watch_audio_init();
+    watch_voice_init(alarm.cfg);
     watch_ble_init();
     init_ui();
     rt_kprintf("WATCH_READY imu=%d storage=%d display=%d\n", imu_ok, store_ok, title != NULL);
     uint32_t last_draw = 0, down_since = 0;
     uint16_t seq = 0;
-    bool key_raw = false, key_stable = false, handled = false;
+    bool key_raw = false, key_stable = false, handled = false, pressed_in_sos = false;
     uint32_t key_changed = 0;
+    enum watch_page page = PAGE_DIAL;
+    bool manual_page = false;
+    uint32_t manual_since = 0;
+    unsigned last_pin = 1000000u;
     while (true) {
-        uint32_t now = watch_now_ms();
         watch_ble_poll();
+        rt_base_t level = rt_hw_interrupt_disable();
         bool pressed = rt_pin_read(KEY2) == PIN_HIGH;
-        if (pressed != key_raw) {
-            key_raw = pressed;
-            key_changed = now;
+        uint32_t edge_ms = key_edge_ms;
+        rt_hw_interrupt_enable(level);
+        uint32_t now = watch_now_ms();
+
+        enum watch_alarm_event voice_event = watch_voice_take_event();
+        if (watch_alarm_finish_voice(&alarm, voice_event)) {
+            watch_voice_set(WATCH_VOICE_OFF);
+            detector = (struct watch_detector){0};
+            if (alarm.demo) {
+                show_notice("演示结束", now);
+                rt_kprintf("WATCH_DEMO_END ms=%u\n", (unsigned)now);
+            }
+            rt_kprintf("WATCH_VOICE_EXIT ms=%u event=%s\n", (unsigned)now,
+                       voice_event == EVT_SOS_VOICE_STOPPED ? "EVT_SOS_VOICE_STOPPED" :
+                       voice_event == EVT_SOS_VOICE_DONE ? "EVT_SOS_VOICE_DONE" : "EVT_SOS_VOICE_FAILED");
         }
-        if (key_stable != key_raw && now - key_changed >= 30u) {
+
+        if (pressed != key_raw || (key_irq_ready && edge_ms != key_changed)) {
+            key_raw = pressed;
+            key_changed = key_irq_ready ? edge_ms : now;
+        }
+        if (key_stable != key_raw && now - key_changed >= KEY2_DEBOUNCE_MS) {
             key_stable = key_raw;
             if (key_stable) {
-                down_since = now;
-                handled = alarm.phase == WATCH_COUNTDOWN;
+                down_since = key_changed + KEY2_DEBOUNCE_MS;
+                handled = watch_alarm_counting(&alarm);
+                pressed_in_sos = alarm.phase == ALARM_STATE_SOS_ACTIVE;
                 cancel_requested |= handled;
             }
         }
-        if (key_stable && !handled && now - down_since >= 1200u) {
-            handled = true;
-            manual_requested = true;
+        if (key_raw && key_stable && !handled) {
+            if (pressed_in_sos && alarm.phase == ALARM_STATE_SOS_ACTIVE &&
+                now - down_since >= alarm.cfg->sos_voice_stop_hold_ms) {
+                handled = true;
+                rt_kprintf("WATCH_VOICE_STOP_REQUEST ms=%u source=KEY2 hold_ms=%u\n",
+                           (unsigned)now, (unsigned)(now - down_since));
+                watch_voice_set(WATCH_VOICE_STOP_HELP);
+            } else if (!pressed_in_sos && alarm.phase == ALARM_STATE_IDLE &&
+                       now - down_since >= KEY2_MANUAL_HOLD_MS) {
+                handled = true;
+                manual_requested = true;
+            }
         }
         if (demo_requested) {
             uint8_t mode = demo_requested;
             demo_requested = 0;
-            if (alarm.phase == WATCH_IDLE) {
+            if (alarm.phase == ALARM_STATE_IDLE) {
                 bench_alarm = mode == 2;
-                watch_alarm_fall(&alarm, now, mode == 1);
+                start_countdown(now, mode == 1);
                 rt_kprintf("WATCH_DEMO_START mode=%u\n", mode);
             }
         }
         if (manual_requested) {
             manual_requested = false;
-            bench_alarm = false;
-            watch_alarm_manual(&alarm, now);
-        }
-        watch_alarm_update(&alarm, now, cancel_requested);
-        cancel_requested = false;
-        if (alarm.phase == WATCH_SUBMIT || alarm.phase == WATCH_CANCELLED) {
-            if (alarm.phase == WATCH_SUBMIT)
-                submit(now);
-            else {
-                show_notice("已取消", now);
-                rt_kprintf("WATCH_CANCELLED\n");
+            enum watch_alarm_event manual = watch_alarm_manual(&alarm);
+            handle_alarm_event(manual, now);
+            if (manual == EVT_SOS_MANUAL) {
+                manual_page = true;
+                manual_since = now;
             }
-            bench_alarm = false;
-            alarm.phase = WATCH_IDLE;
-            detector = (struct watch_detector){0};
         }
+        enum watch_alarm_event alarm_event = watch_alarm_update(&alarm, now, cancel_requested);
+        cancel_requested = false;
+        handle_alarm_event(alarm_event, now);
 
         struct watch_imu sample;
         bool sample_ready = imu_ok && watch_imu_read(&sample);
         if (sample_ready) {
             ++samples_read;
             sensor_seen = now;
-            if (alarm.phase == WATCH_IDLE && watch_detect(&detector, &sample, now)) {
-                watch_alarm_fall(&alarm, now, false);
+            if (alarm.phase == ALARM_STATE_IDLE && watch_detect(&detector, &sample, now)) {
+                start_countdown(now, false);
                 rt_kprintf("WATCH_FALL candidate\n");
             }
         }
-        watch_motor(watch_alarm_vibrate(&alarm, now));
-        watch_audio(alarm.phase == WATCH_COUNTDOWN);
+        if (key_stable && watch_alarm_counting(&alarm))
+            handled = true;
+        watch_motor(watch_alarm_vibrate(&alarm, now), alarm.cfg->vib_pwm_duty);
         rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
         bool sent_sos = outbox(now);
         rt_mutex_release(&store_mutex);
@@ -447,12 +626,31 @@ int main(void)
             if (!sent_sos)
                 watch_ble_send(frame);
         }
-        if (now - last_draw >= 150u) {
+        uint32_t epoch;
+        bool time_changed = watch_ble_time(&epoch);
+        if (time_changed)
+            watch_time_sync(epoch, now);
+        watch_time_poll(now);
+
+        if (manual_page && now - manual_since >= NOTICE_MS)
+            manual_page = false;
+        const bool alarm_active = alarm.phase != ALARM_STATE_IDLE || manual_page;
+        if (!alarm_active && visible_page == PAGE_ALARM)
+            page = PAGE_DIAL;
+        update_key1(&page, alarm_active || visible_page == PAGE_ALARM, now);
+        unsigned pin = watch_ble_pin();
+        if (pin != last_pin && pin < 1000000u && !alarm_active && page != PAGE_SLEEP)
+            page = PAGE_FUNCTION;
+        last_pin = pin;
+        enum watch_page next = alarm_active ? PAGE_ALARM : page;
+        if (time_changed || next != visible_page || now - last_draw >= 150u) {
             last_draw = now;
-            render(now);
+            render(now, next, pin);
         }
-        if (title)
+        if (title && visible_page != PAGE_SLEEP)
             lv_timer_handler();
-        rt_thread_mdelay(4);
+        rt_uint32_t key_events;
+        rt_event_recv(&key_wake, KEY2_EDGE_EVENT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                      rt_tick_from_millisecond(WATCH_POLL_MS), &key_events);
     }
 }

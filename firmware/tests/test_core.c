@@ -4,25 +4,65 @@
 #include <stdio.h>
 #include <string.h>
 
-int main(void)
+static void test_alarm(void)
 {
-    struct watch_alarm alarm = {0};
+    struct watch_alarm alarm = {.cfg = &alarm_cfg_default};
     /* Begin near the uint32 timestamp rollover. */
     uint32_t start = UINT32_MAX - 8100u;
     watch_alarm_fall(&alarm, start, false);
     assert(watch_alarm_seconds(&alarm, start) == 30);
-    assert(watch_alarm_vibrate(&alarm, start + 9999u));
-    assert(!watch_alarm_vibrate(&alarm, start + 10000u));
-    watch_alarm_update(&alarm, start + 29999u, false);
-    assert(alarm.phase == WATCH_COUNTDOWN);
-    watch_alarm_update(&alarm, start + 29999u, true);
-    assert(alarm.phase == WATCH_CANCELLED);
-    watch_alarm_fall(&alarm, 0, false);
-    watch_alarm_update(&alarm, 30000, false);
-    assert(alarm.phase == WATCH_SUBMIT && alarm.reason == WATCH_FALL);
-    watch_alarm_manual(&alarm, 0);
-    assert(alarm.phase == WATCH_SUBMIT && alarm.reason == WATCH_MANUAL_SOS);
+    assert(watch_alarm_vibrate(&alarm, start));
+    assert(watch_alarm_vibrate(&alarm, start + 599u));
+    assert(!watch_alarm_vibrate(&alarm, start + 600u));
+    assert(!watch_alarm_vibrate(&alarm, start + 1499u));
+    assert(watch_alarm_vibrate(&alarm, start + 1500u));
+    assert(watch_alarm_update(&alarm, start + 19999u, false) == EVT_ALARM_NONE);
+    assert(alarm.phase == ALARM_STATE_COUNTDOWN_NORMAL);
+    assert(watch_alarm_vibrate(&alarm, start + 19999u));
+    assert(watch_alarm_update(&alarm, start + 20000u, false) == EVT_ALARM_URGENT);
+    assert(alarm.phase == ALARM_STATE_COUNTDOWN_URGENT);
+    assert(watch_alarm_vibrate(&alarm, start + 20000u));
+    assert(watch_alarm_vibrate(&alarm, start + 20499u));
+    assert(!watch_alarm_vibrate(&alarm, start + 20500u));
+    assert(!watch_alarm_vibrate(&alarm, start + 20899u));
+    assert(watch_alarm_vibrate(&alarm, start + 20900u));
+    assert(watch_alarm_update(&alarm, start + 29999u, true) == EVT_ALARM_CANCEL);
+    assert(alarm.phase == ALARM_STATE_IDLE && !watch_alarm_vibrate(&alarm, start + 29999u));
+    assert(watch_alarm_update(&alarm, start + 30000u, false) == EVT_ALARM_NONE);
 
+    alarm_cfg_t shorter = alarm_cfg_default;
+    shorter.cancel_timeout_ms = 12000u;
+    alarm.cfg = &shorter;
+    watch_alarm_fall(&alarm, 0, false);
+    assert(watch_alarm_seconds(&alarm, 0) == 12);
+    assert(watch_alarm_update(&alarm, 7999u, false) == EVT_ALARM_NONE);
+    assert(watch_alarm_update(&alarm, 8000u, false) == EVT_ALARM_URGENT);
+    assert(watch_alarm_seconds(&alarm, 8000u) == 4);
+    assert(watch_alarm_vibrate(&alarm, 8499u));
+    assert(!watch_alarm_vibrate(&alarm, 8500u));
+    assert(watch_alarm_vibrate(&alarm, 11999u));
+    assert(!watch_alarm_vibrate(&alarm, 12000u));
+    assert(watch_alarm_update(&alarm, 12000u, true) == EVT_SOS_TIMEOUT);
+    assert(alarm.phase == ALARM_STATE_SOS_ACTIVE && alarm.reason == WATCH_FALL);
+    assert(watch_alarm_update(&alarm, 12001u, false) == EVT_ALARM_NONE);
+    assert(watch_alarm_manual(&alarm) == EVT_ALARM_NONE);
+    watch_alarm_fall(&alarm, 12001u, false);
+    assert(alarm.phase == ALARM_STATE_SOS_ACTIVE);
+    assert(!watch_alarm_finish_voice(&alarm, EVT_ALARM_NONE));
+    assert(watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_STOPPED));
+    assert(!watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_STOPPED));
+    assert(watch_alarm_manual(&alarm) == EVT_SOS_MANUAL);
+    assert(alarm.phase == ALARM_STATE_IDLE && alarm.reason == WATCH_MANUAL_SOS);
+
+    watch_alarm_fall(&alarm, 0, true);
+    assert(watch_alarm_update(&alarm, 12000u, false) == EVT_SOS_TIMEOUT);
+    assert(alarm.demo && watch_alarm_finish_voice(&alarm, EVT_SOS_VOICE_DONE));
+    assert(alarm.phase == ALARM_STATE_IDLE);
+}
+
+int main(void)
+{
+    test_alarm();
     struct watch_detector detector = {0};
     const struct watch_imu still = {.az = 1000}, impact = {.ax = 3400, .gx = 2500}, settled = {.ay = 1000};
     for (unsigned i = 0; i < 20; ++i)

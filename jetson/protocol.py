@@ -11,6 +11,8 @@ TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 IMU_TYPE = 0x01
 SOS_TYPE = 0x02
 ACK_TYPE = 0x81
+TIME_SYNC_TYPE = 0x82
+WATCH_OFFSET_MINUTES = 480
 QUEUED = 1
 ACCEPTED = 2
 FAILED = 3
@@ -23,6 +25,7 @@ DEMO_NUMBERS = ("+12025550100", "+12025550101", "+12025550102")
 IMU_FRAME = struct.Struct("<BBHI6h")
 SOS_FRAME = struct.Struct("<BBQBB8s")
 ACK_FRAME = struct.Struct("<BBQ10x")
+TIME_SYNC_FRAME = struct.Struct("<BBIh12x")
 Imu = namedtuple("Imu", "seq uptime_ms ax ay az gx gy gz")
 Sos = namedtuple("Sos", "reason event_id index count phone")
 
@@ -78,3 +81,10 @@ def decode(frame):
 
 def ack(event_id, status):
     return ACK_FRAME.pack(ACK_TYPE, status, event_id)
+
+
+def time_sync(utc_epoch):
+    local_epoch = utc_epoch + WATCH_OFFSET_MINUTES * 60
+    if not 1735689600 <= local_epoch < 4102444800:
+        raise ValueError("Jetson clock outside the supported watch date range")
+    return TIME_SYNC_FRAME.pack(TIME_SYNC_TYPE, 1, utc_epoch, WATCH_OFFSET_MINUTES)

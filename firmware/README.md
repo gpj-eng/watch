@@ -1,6 +1,6 @@
 # 黄山派老人求助手表固件
 
-目标板为 `sf32lb52-lchspi-ulp`，基于 SiFli SDK v2.5.2 和 LVGL v9。待机页显示 RTC 日期和 24 小时时钟。IMU 检出疑似跌倒后切到红底倒计时页，取消或倒计时结束后回到时钟。串口演练显示「演示提醒」。28 px 中文字号和 82 px 高按钮适配 390×450 面板。
+目标板为 `sf32lb52-lchspi-ulp`，基于 SiFli SDK v2.5.2 和 LVGL v9。一级表盘显示日期、星期和 24 小时时钟。短按 KEY1 切到二级功能页，二级页提供长按求助。长按 KEY1 约 3 秒进入息屏监测，短按后返回表盘。疑似跌倒或手动 SOS 会点亮屏幕并抢占页面。
 
 疑似跌倒确认后，马达和喇叭立即启动。马达的 1 kHz、50% PWM 在 10 秒后停止。喇叭间歇响铃至用户取消或 30 秒倒计时结束。在这 30 秒内按 KEY2 或点屏幕上的「我没事」会关闭声振并取消提交。倒计时结束后将 SOS 写入闪存队列，转发给 Jetson。待机时长按 KEY2 约 1.2 秒或长按屏幕按钮可直接提交手动 SOS。
 
@@ -22,10 +22,17 @@ scons --board=sf32lb52-lchspi-ulp -j8
 
 1. 接 USB 数据线和 SPK 喇叭。COM 号在设备管理器查看。串口助手设 1000000、8N1、无流控，命令末尾发送回车。
 2. 输入 `watch_status`。先检查 `imu=1 flash=1 display=1`，重复查询看 `samples` 增加。
-3. 输入 `watch_demo` 检查声振和倒计时，不会提交 SOS。第一次按 KEY2 验证取消。第二次让倒计时走完，核对 10 秒停振、30 秒结束提醒。IMU 实际检出时可查 `WATCH_FALL candidate` 和 `WATCH_SCREEN fall`。
+3. 输入 `watch_demo` 检查本机演练。按 KEY2 验证取消，也可以让倒计时走完测试后续报警页面。IMU 实际检出时可查 `WATCH_FALL candidate` 和 `WATCH_PAGE alarm`。
 4. 进入蓝牙联调时设置保留测试号码 `watch_contacts +12025550100 +12025550101`。用 `watch_pair` 开启 60 秒配对窗口，在 Jetson 输入手表显示的六位配对码。用 `watch_bench` 验证带测试号码的倒计时取消和超时上报，详细步骤见 [Jetson 接入说明](../jetson/README.md)。
 5. 测试完成后用 `watch_contacts clear` 清空联系人设置。使用真实联系人前，为 Jetson 配好账号、短信签名、模板和号码白名单，并用已同意的测试联系人验证接收回执。
 
-看到 `--:--` 或需要校时时，通过串口执行 `show_date 年 月 日 时 分 秒`，再输入 `show_date` 读回本地时间。
+## 时钟与 KEY1 验收
+
+1. 启动更新后的配对网关。Jetson 打印 `TIME_SYNC sent` 后，以手表串口的 `WATCH_TIME_SYNC source=ble rtc=ok flash=saved` 确认首次校时落盘。近期重复校时可以得到 `flash=unchanged` 或 `flash=deferred`。Jetson 以北京时间为手表校时。长时间使用时，手表每六小时保存一次有效时间检查点。
+2. 暂停网关，保持供电，执行五次 `reboot`。每次确认 `WATCH_TIME_BOOT source=rtc`、`WATCH_PAGE dial`，检查首屏日期、星期和时间。若 RTC 在某次重启后失效，应看到 `source=flash`，且仍显示有效时间。校时前的新环境若没有有效 RTC 和 Flash 记录，应看到 `source=build`，表盘小点提示尚未完成同步。
+3. 在纯 USB 和电池供电条件下分别记录 `WATCH_POWER`。短按 KEY1 两次，检查 `WATCH_KEY1 short`、`WATCH_PAGE function`、`WATCH_KEY1 short`、`WATCH_PAGE dial`。两页各确认一次求助按钮的位置。
+4. 长按 KEY1 约 3 秒后松手，检查 `WATCH_KEY1 long mode=monitor_sleep`、`WATCH_PAGE sleep`。短按可亮屏回表盘。重复息屏并输入 `watch_demo`，核对屏幕点亮、`WATCH_PAGE alarm`。报警期间按 KEY1 应记录 `WATCH_KEY1 ignored=alarm`。按 KEY2 取消，或等待本机报警流程结束，应回到 `WATCH_PAGE dial`。纯 USB 若长按无响应，记录 `vbus=1` 和按键实际表现。
+
+串口的 `show_date` 用于读出 RTC。硬件完全断电时，表盘从 Flash 保存的值恢复走时。断电期间的时间由 Jetson 在再次连接时校准。
 
 中文字体为 SDK 附带的 Noto Sans SC 字形子集，许可见 `Font-OFL.txt`。构建脚手架来自 SiFli SDK BLE 外围设备示例。

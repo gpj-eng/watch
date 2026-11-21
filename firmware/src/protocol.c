@@ -66,3 +66,26 @@ bool watch_frame_ack(const uint8_t *frame, unsigned size, uint64_t *id, uint8_t 
     *status = frame[1];
     return true;
 }
+
+bool watch_frame_time(const uint8_t *frame, unsigned size, uint32_t *local_epoch)
+{
+    if (size != WATCH_FRAME_SIZE || frame[0] != WATCH_TIME_SYNC_TYPE || frame[1] != 1)
+        return false;
+    for (unsigned i = 8; i < size; ++i)
+        if (frame[i])
+            return false;
+
+    uint32_t utc = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        utc |= (uint32_t)frame[2 + i] << (8u * i);
+    int offset_minutes = frame[6] | (frame[7] << 8);
+    if (offset_minutes >= 32768)
+        offset_minutes -= 65536;
+    if (offset_minutes < -840 || offset_minutes > 840)
+        return false;
+    const int64_t local = (int64_t)utc + offset_minutes * 60;
+    if (local < WATCH_TIME_MIN || local >= WATCH_TIME_LIMIT)
+        return false;
+    *local_epoch = (uint32_t)local;
+    return true;
+}

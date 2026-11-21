@@ -1,39 +1,101 @@
 #include "alarm.h"
 #include <math.h>
 
+const alarm_cfg_t alarm_cfg_default = {
+    .cancel_timeout_ms = 30000u,
+    .vib_normal_on_ms = 600u,
+    .vib_normal_off_ms = 900u,
+    .vib_urgent_on_ms = 500u,
+    .vib_urgent_off_ms = 400u,
+    .sos_voice_interval_ms = 3000u,
+    .sos_voice_stop_hold_ms = 2000u,
+    .vib_pwm_duty = 50u,
+    .sos_voice_repeat_max = 10u,
+};
+
+static uint32_t normal_phase_ms(const struct watch_alarm *alarm)
+{
+    return (uint32_t)((uint64_t)alarm->cfg->cancel_timeout_ms * 2u / 3u);
+}
+
+bool watch_alarm_counting(const struct watch_alarm *alarm)
+{
+    return alarm->phase == ALARM_STATE_COUNTDOWN_NORMAL || alarm->phase == ALARM_STATE_COUNTDOWN_URGENT;
+}
+
 void watch_alarm_fall(struct watch_alarm *alarm, uint32_t now, bool demo)
 {
-    if (alarm->phase == WATCH_COUNTDOWN || alarm->phase == WATCH_SUBMIT)
+    if (alarm->phase != ALARM_STATE_IDLE)
         return;
-    *alarm = (struct watch_alarm){WATCH_COUNTDOWN, now, WATCH_FALL, demo};
+    alarm->phase = ALARM_STATE_COUNTDOWN_NORMAL;
+    alarm->started_ms = now;
+    alarm->reason = WATCH_FALL;
+    alarm->demo = demo;
 }
 
-void watch_alarm_manual(struct watch_alarm *alarm, uint32_t now)
+enum watch_alarm_event watch_alarm_manual(struct watch_alarm *alarm)
 {
-    *alarm = (struct watch_alarm){WATCH_SUBMIT, now, WATCH_MANUAL_SOS, false};
+    if (alarm->phase != ALARM_STATE_IDLE)
+        return EVT_ALARM_NONE;
+    alarm->reason = WATCH_MANUAL_SOS;
+    alarm->demo = false;
+    return EVT_SOS_MANUAL;
 }
 
-void watch_alarm_update(struct watch_alarm *alarm, uint32_t now, bool cancel)
+enum watch_alarm_event watch_alarm_update(struct watch_alarm *alarm, uint32_t now, bool cancel)
 {
-    if (alarm->phase != WATCH_COUNTDOWN)
-        return;
-    if (now - alarm->started_ms >= WATCH_CANCEL_MS)
-        alarm->phase = WATCH_SUBMIT;
-    else if (cancel)
-        alarm->phase = WATCH_CANCELLED;
+    if (!watch_alarm_counting(alarm))
+        return EVT_ALARM_NONE;
+    uint32_t elapsed = now - alarm->started_ms;
+    if (elapsed >= alarm->cfg->cancel_timeout_ms) {
+        alarm->phase = ALARM_STATE_SOS_ACTIVE;
+        return EVT_SOS_TIMEOUT;
+    }
+    if (cancel) {
+        alarm->phase = ALARM_STATE_IDLE;
+        return EVT_ALARM_CANCEL;
+    }
+    if (alarm->phase == ALARM_STATE_COUNTDOWN_NORMAL && elapsed >= normal_phase_ms(alarm)) {
+        alarm->phase = ALARM_STATE_COUNTDOWN_URGENT;
+        return EVT_ALARM_URGENT;
+    }
+    return EVT_ALARM_NONE;
+}
+
+bool watch_alarm_finish_voice(struct watch_alarm *alarm, enum watch_alarm_event event)
+{
+    if (alarm->phase != ALARM_STATE_SOS_ACTIVE)
+        return false;
+    if (event != EVT_SOS_VOICE_DONE && event != EVT_SOS_VOICE_STOPPED && event != EVT_SOS_VOICE_FAILED)
+        return false;
+    alarm->phase = ALARM_STATE_IDLE;
+    return true;
 }
 
 bool watch_alarm_vibrate(const struct watch_alarm *alarm, uint32_t now)
 {
-    if (alarm->phase != WATCH_COUNTDOWN)
+    if (!watch_alarm_counting(alarm))
         return false;
-    return now - alarm->started_ms < WATCH_VIBRATION_MS;
+    uint32_t elapsed = now - alarm->started_ms;
+    const alarm_cfg_t *cfg = alarm->cfg;
+    if (elapsed >= cfg->cancel_timeout_ms)
+        return false;
+    uint32_t normal = normal_phase_ms(alarm);
+    bool urgent = elapsed >= normal;
+    uint32_t on = urgent ? cfg->vib_urgent_on_ms : cfg->vib_normal_on_ms;
+    uint32_t off = urgent ? cfg->vib_urgent_off_ms : cfg->vib_normal_off_ms;
+    uint64_t period = (uint64_t)on + off;
+    uint32_t phase_elapsed = urgent ? elapsed - normal : elapsed;
+    return period && phase_elapsed % period < on;
 }
 
 unsigned watch_alarm_seconds(const struct watch_alarm *alarm, uint32_t now)
 {
     uint32_t elapsed = now - alarm->started_ms;
-    return elapsed < WATCH_CANCEL_MS ? (WATCH_CANCEL_MS - elapsed + 999u) / 1000u : 0u;
+    if (!watch_alarm_counting(alarm) || elapsed >= alarm->cfg->cancel_timeout_ms)
+        return 0;
+    uint32_t remaining = alarm->cfg->cancel_timeout_ms - elapsed;
+    return remaining / 1000u + (remaining % 1000u != 0);
 }
 
 static float magnitude(const float v[3])

@@ -4,13 +4,39 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define WATCH_VIBRATION_MS 10000u
-#define WATCH_CANCEL_MS 30000u
-
 enum watch_reason { WATCH_FALL = 1, WATCH_MANUAL_SOS = 2 };
-enum watch_alarm_phase { WATCH_IDLE, WATCH_COUNTDOWN, WATCH_CANCELLED, WATCH_SUBMIT };
+enum watch_alarm_phase {
+    ALARM_STATE_IDLE,
+    ALARM_STATE_COUNTDOWN_NORMAL,
+    ALARM_STATE_COUNTDOWN_URGENT,
+    ALARM_STATE_SOS_ACTIVE,
+};
+
+enum watch_alarm_event {
+    EVT_ALARM_NONE,
+    EVT_ALARM_URGENT,
+    EVT_ALARM_CANCEL,
+    EVT_SOS_TIMEOUT,
+    EVT_SOS_MANUAL,
+    EVT_SOS_VOICE_DONE,
+    EVT_SOS_VOICE_STOPPED,
+    EVT_SOS_VOICE_FAILED,
+};
+
+typedef struct {
+    uint32_t cancel_timeout_ms;
+    uint32_t vib_normal_on_ms, vib_normal_off_ms;
+    uint32_t vib_urgent_on_ms, vib_urgent_off_ms;
+    uint32_t sos_voice_interval_ms;
+    uint32_t sos_voice_stop_hold_ms;
+    uint8_t vib_pwm_duty;
+    uint8_t sos_voice_repeat_max;
+} alarm_cfg_t;
+
+extern const alarm_cfg_t alarm_cfg_default;
 
 struct watch_alarm {
+    const alarm_cfg_t *cfg;
     enum watch_alarm_phase phase;
     uint32_t started_ms;
     enum watch_reason reason;
@@ -18,8 +44,10 @@ struct watch_alarm {
 };
 
 void watch_alarm_fall(struct watch_alarm *alarm, uint32_t now, bool demo);
-void watch_alarm_manual(struct watch_alarm *alarm, uint32_t now);
-void watch_alarm_update(struct watch_alarm *alarm, uint32_t now, bool cancel);
+enum watch_alarm_event watch_alarm_manual(struct watch_alarm *alarm);
+enum watch_alarm_event watch_alarm_update(struct watch_alarm *alarm, uint32_t now, bool cancel);
+bool watch_alarm_counting(const struct watch_alarm *alarm);
+bool watch_alarm_finish_voice(struct watch_alarm *alarm, enum watch_alarm_event event);
 bool watch_alarm_vibrate(const struct watch_alarm *alarm, uint32_t now);
 unsigned watch_alarm_seconds(const struct watch_alarm *alarm, uint32_t now);
 

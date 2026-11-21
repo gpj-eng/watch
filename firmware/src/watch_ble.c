@@ -18,6 +18,7 @@ static volatile bool powered, authenticated, pair_open;
 static volatile uint32_t pair_started;
 static volatile unsigned pair_pin = 1000000;
 static rt_mq_t acknowledgements;
+static rt_mq_t time_updates;
 SIBLES_ADVERTISING_CONTEXT_DECLAR(advertisement);
 
 BLE_GATT_SERVICE_DEFINE_128(watch_att_db)
@@ -61,8 +62,15 @@ static uint8_t set_value(uint8_t connection, sibles_set_cbk_t *p)
         cccd = p->value[0] & 1;
         return 0;
     }
-    if (p->idx == RX_VALUE && p->len == 20 && authenticated)
-        return rt_mq_send(acknowledgements, p->value, 20) == RT_EOK ? 0 : 0x80;
+    if (p->idx == RX_VALUE && p->len == WATCH_FRAME_SIZE && authenticated) {
+        if (p->value[0] == WATCH_TIME_SYNC_TYPE) {
+            uint32_t epoch;
+            if (!watch_frame_time(p->value, p->len, &epoch))
+                return SIBLES_ATT_ERR_WRITE_NOT_PERMITTED;
+            return time_updates && rt_mq_send(time_updates, &epoch, sizeof(epoch)) == RT_EOK ? 0 : 0x80;
+        }
+        return rt_mq_send(acknowledgements, p->value, WATCH_FRAME_SIZE) == RT_EOK ? 0 : 0x80;
+    }
     return SIBLES_ATT_ERR_WRITE_NOT_PERMITTED;
 }
 
@@ -104,11 +112,11 @@ static void start_advertisement(void)
         sibles_advertising_start(advertisement);
 }
 
-static void mark_authenticated(uint8_t connection, uint8_t auth)
+static void mark_authenticated(uint8_t connection, bool accepted)
 {
     if (connection != conn)
         return;
-    authenticated = (auth & (GAP_AUTH_MITM | GAP_AUTH_BOND)) == (GAP_AUTH_MITM | GAP_AUTH_BOND);
+    authenticated = accepted;
     if (authenticated) {
         pair_open = false;
         pair_pin = 1000000;
@@ -140,13 +148,22 @@ static int ble_event(uint16_t event, uint8_t *data, uint16_t len, uint32_t conte
         break;
     case BLE_GAP_ENCRYPT_IND: {
         ble_gap_encrypt_ind_t *ind = (void *)data;
-        mark_authenticated(ind->conn_idx, ind->auth);
+        /* On re-encryption the SDK can omit MITM from the reported flags.
+         * Reuse security only after encryption succeeds with a stored bond. */
+        const bool bonded = connection_manager_get_bond_state(ind->conn_idx) == BOND_STATE_BONDED;
+        const uint8_t secure_bond = GAP_AUTH_SEC_CON | GAP_AUTH_BOND;
+        const uint8_t passkey_bond = GAP_AUTH_MITM | GAP_AUTH_BOND;
+        const bool passkey_verified = (ind->auth & passkey_bond) == passkey_bond;
+        const bool resuming_bond = bonded && (ind->auth & secure_bond) == secure_bond;
+        mark_authenticated(ind->conn_idx, passkey_verified || resuming_bond);
         break;
     }
     case BLE_GAP_BOND_IND: {
         ble_gap_bond_ind_t *ind = (void *)data;
-        if (ind->info == GAPC_PAIRING_SUCCEED)
-            mark_authenticated(ind->conn_idx, ind->data.auth.info);
+        if (ind->info == GAPC_PAIRING_SUCCEED) {
+            const uint8_t authenticated_bond = GAP_AUTH_MITM | GAP_AUTH_BOND;
+            mark_authenticated(ind->conn_idx, (ind->data.auth.info & authenticated_bond) == authenticated_bond);
+        }
         break;
     }
     case CONNECTION_MANAGER_BOND_AUTH_INFOR: {
@@ -172,6 +189,7 @@ BLE_EVENT_REGISTER(ble_event, NULL);
 void watch_ble_init(void)
 {
     acknowledgements = rt_mq_create("sosack", 20, 8, RT_IPC_FLAG_FIFO);
+    time_updates = rt_mq_create("btime", sizeof(uint32_t), 1, RT_IPC_FLAG_FIFO);
     if (acknowledgements)
         sifli_ble_enable();
 }
@@ -194,12 +212,13 @@ bool watch_ble_ready(void)
     return svc_handle && conn != 0xff && authenticated && cccd;
 }
 
-bool watch_ble_send(uint8_t frame[20])
+bool watch_ble_send(uint8_t frame[WATCH_FRAME_SIZE])
 {
     if (!watch_ble_ready())
         return false;
-    sibles_value_t data = {.hdl = svc_handle, .idx = TX_VALUE, .len = 20, .value = frame};
-    return sibles_write_value(conn, &data) == 0;
+    sibles_value_t data = {.hdl = svc_handle, .idx = TX_VALUE, .len = WATCH_FRAME_SIZE, .value = frame};
+    /* The SDK returns the accepted byte count, or zero when its TX buffer is full. */
+    return sibles_write_value(conn, &data) == data.len;
 }
 
 bool watch_ble_ack(uint64_t *id, uint8_t *status)
@@ -207,6 +226,11 @@ bool watch_ble_ack(uint64_t *id, uint8_t *status)
     uint8_t frame[20];
     return acknowledgements && rt_mq_recv(acknowledgements, frame, sizeof(frame), 0) == RT_EOK &&
            watch_frame_ack(frame, sizeof(frame), id, status);
+}
+
+bool watch_ble_time(uint32_t *local_epoch)
+{
+    return time_updates && rt_mq_recv(time_updates, local_epoch, sizeof(*local_epoch), 0) == RT_EOK;
 }
 
 void watch_ble_pair(void)
