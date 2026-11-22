@@ -1,6 +1,10 @@
 #include "watch_board.h"
 #include "watch_time.h"
+#include "watch_rtc.h"
 #include "watch_wrist.h"
+#include "watch_wallpapers.h"
+#include "watch_menu.h"
+#include "watch_settings_audio.h"
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <finsh.h>
@@ -12,13 +16,16 @@
 LV_FONT_DECLARE(watch_cjk);
 LV_FONT_DECLARE(watch_dial_date);
 LV_FONT_DECLARE(watch_dial_digits);
+LV_FONT_DECLARE(watch_wallpaper_font);
 
-#define KEY1 34
+#define KEY1 WATCH_POWER_KEY_PIN
 #define KEY2 43
 #define VBUS_DET 44
 #define KEY1_DEBOUNCE_MS 30u
 #define KEY1_SHORT_MS 500u
+#define KEY1_PROGRESS_MS 1000u
 #define KEY1_LONG_MS 3000u
+#define KEY1_FULL_FRAME_MS 120u
 #define KEY1_POWER_GUARD_MS 300u
 #define NOTICE_MS 12000u
 #define KEY2_EDGE_EVENT (1u << 0)
@@ -32,6 +39,13 @@ LV_FONT_DECLARE(watch_dial_digits);
 #define RESOLVED_NOTICE_MS 2000u
 #define HOLD_DRAW_MS 25u
 #define STORE_VERSION 0x48530201u
+#define WALLPAPER_KEY "wallpaper_idx"
+#define BRIGHTNESS_KEY "ui_brightness"
+#define VOLUME_KEY "ui_volume"
+#define MIN_BRIGHTNESS 10u
+#define DEFAULT_VOLUME 60u
+#define SWIPE_AXIS_PIXELS 12
+#define SWIPE_PAGE_PIXELS 30
 
 struct persisted {
     uint32_t version;
@@ -65,10 +79,30 @@ static volatile uint32_t samples_read;
 static bool bench_alarm;
 static bool imu_ok, manual_requested, cancel_requested;
 static uint32_t sensor_seen;
-enum watch_page { PAGE_NONE, PAGE_DIAL, PAGE_FUNCTION, PAGE_SLEEP, PAGE_ALARM };
+enum watch_page { PAGE_NONE, PAGE_DIAL, PAGE_FUNCTION, PAGE_MENU, PAGE_SLEEP, PAGE_ALARM, PAGE_POWER_HOLD };
+enum key1_power_state { KEY1_POWER_IDLE, KEY1_POWER_HOLDING, KEY1_POWER_CONFIRMED };
+enum swipe_axis { SWIPE_UNDECIDED, SWIPE_HORIZONTAL, SWIPE_VERTICAL, SWIPE_CONTROL };
+static enum key1_power_state key1_power;
+static uint32_t key1_power_progress, key1_power_confirmed_at;
+static bool key1_released;
 static enum watch_page visible_page;
-static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label, *sync_hint;
-static lv_obj_t *dial_date, *dial_digits[5];
+static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label;
+static lv_obj_t *wallpaper_image, *wallpaper_button, *wallpaper_status;
+static lv_obj_t *help_back;
+static lv_obj_t *dial_date, *dial_date_shadow, *clock_row, *dial_digits[5], *digit_shadows[5];
+static lv_obj_t *clock_placeholder;
+static uint8_t wallpaper_idx;
+static bool wallpaper_requested;
+static uint8_t panel_brightness = WATCH_PANEL_BRIGHTNESS, saved_brightness = WATCH_PANEL_BRIGHTNESS;
+static uint8_t normal_volume = DEFAULT_VOLUME, saved_volume = DEFAULT_VOLUME;
+static enum watch_menu_page menu_page, requested_menu;
+static enum watch_page requested_page;
+static lv_indev_read_cb_t original_touch_read;
+static lv_point_t touch_origin;
+static enum watch_page touch_page;
+static enum swipe_axis touch_axis;
+static bool touch_down, touch_moved;
+static int swipe_direction;
 static lv_obj_t *resolve_arc, *resolve_percent, *resolve_text;
 static rt_device_t lcd;
 static const char *notice;
@@ -118,6 +152,40 @@ static void load_store(void)
         if (!resolutions_ok)
             rt_kprintf("WATCH_RESOLVED storage=invalid\n");
     }
+}
+
+static bool read_ui_byte(const char *key, uint8_t *value)
+{
+    struct fdb_blob blob;
+    return database_ready &&
+           fdb_kv_get_blob(&database, key, fdb_blob_make(&blob, value, sizeof(*value))) == sizeof(*value) &&
+           blob.saved.len == sizeof(*value);
+}
+
+static bool save_ui_byte(const char *key, uint8_t value)
+{
+    struct fdb_blob blob;
+    rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
+    bool saved = database_ready &&
+                 fdb_kv_set_blob(&database, key, fdb_blob_make(&blob, &value, sizeof(value))) == FDB_NO_ERR;
+    rt_mutex_release(&store_mutex);
+    return saved;
+}
+
+static void load_ui_settings(void)
+{
+    uint8_t index = 0;
+    if (read_ui_byte(WALLPAPER_KEY, &index) && index < g_wallpaper_count) {
+        wallpaper_idx = index;
+        rt_kprintf("WATCH_WALLPAPER load index=%u count=%u saved=1\n", (unsigned)index, g_wallpaper_count);
+    } else {
+        rt_kprintf("WATCH_WALLPAPER load index=0 count=%u saved=0\n", g_wallpaper_count);
+    }
+    uint8_t value;
+    if (read_ui_byte(BRIGHTNESS_KEY, &value) && value >= MIN_BRIGHTNESS && value <= 100u)
+        panel_brightness = saved_brightness = value;
+    if (read_ui_byte(VOLUME_KEY, &value) && value <= 100u)
+        normal_volume = saved_volume = value;
 }
 
 static void watch_contacts(int argc, char **argv)
@@ -482,7 +550,8 @@ static void action_pressed(lv_event_t *e)
         cancel_requested = true;
         rt_kprintf("WATCH_TOUCH cancel\n");
     }
-    if (visible_page == PAGE_FUNCTION && alarm.phase == ALARM_STATE_IDLE && code == LV_EVENT_LONG_PRESSED) {
+    if (visible_page == PAGE_FUNCTION && alarm.phase == ALARM_STATE_IDLE && code == LV_EVENT_LONG_PRESSED &&
+        (!touch_down || !touch_moved)) {
         manual_requested = true;
         rt_kprintf("WATCH_TOUCH manual\n");
     }
@@ -499,30 +568,246 @@ static lv_obj_t *label(lv_obj_t *parent, int y, const lv_font_t *font, uint32_t 
     return obj;
 }
 
+static void show_wallpaper_selection(void)
+{
+    const char *name = g_wallpaper_names[wallpaper_idx];
+    if (name && *name)
+        lv_label_set_text_fmt(wallpaper_status, "%u/%u · %s", (unsigned)wallpaper_idx + 1, g_wallpaper_count, name);
+    else
+        lv_label_set_text_fmt(wallpaper_status, "%u/%u", (unsigned)wallpaper_idx + 1, g_wallpaper_count);
+}
+
+static bool apply_wallpaper(unsigned index)
+{
+    if (index >= g_wallpaper_count)
+        return false;
+    if (index == wallpaper_idx)
+        return true;
+
+    if (!save_ui_byte(WALLPAPER_KEY, (uint8_t)index)) {
+        rt_kprintf("WATCH_WALLPAPER save_error index=%u\n", index);
+        return false;
+    }
+
+    wallpaper_idx = (uint8_t)index;
+    lv_img_set_src(wallpaper_image, g_wallpapers[index]);
+    show_wallpaper_selection();
+    rt_kprintf("WATCH_WALLPAPER apply index=%u count=%u\n", index, g_wallpaper_count);
+    return true;
+}
+
+static void request_wallpaper(lv_event_t *event)
+{
+    (void)event;
+    wallpaper_requested = visible_page == PAGE_FUNCTION;
+}
+
+static bool set_panel_brightness(uint8_t value)
+{
+    return lcd && rt_device_control(lcd, RTGRAPHIC_CTRL_SET_BRIGHTNESS, &value) == RT_EOK;
+}
+
+static unsigned menu_get_level(enum watch_menu_page page)
+{
+    return page == MENU_BRIGHTNESS ? panel_brightness : normal_volume;
+}
+
+static bool menu_set_level(enum watch_menu_page page, unsigned percent, bool commit)
+{
+    const bool brightness = page == MENU_BRIGHTNESS;
+    if (brightness && percent < MIN_BRIGHTNESS)
+        percent = MIN_BRIGHTNESS;
+    if (percent > 100u)
+        percent = 100u;
+    uint8_t *level = brightness ? &panel_brightness : &normal_volume;
+    uint8_t *saved = brightness ? &saved_brightness : &saved_volume;
+    if (*level != percent) {
+        if (brightness && !set_panel_brightness((uint8_t)percent))
+            return false;
+        *level = (uint8_t)percent;
+    }
+    if (!commit || *level == *saved)
+        return true;
+    if (!save_ui_byte(brightness ? BRIGHTNESS_KEY : VOLUME_KEY, *level)) {
+        if (!brightness || set_panel_brightness(*saved))
+            *level = *saved;
+        return false;
+    }
+    *saved = *level;
+    rt_kprintf("WATCH_UI %s=%u\n", brightness ? "brightness" : "volume", (unsigned)*level);
+    return true;
+}
+
+static bool menu_play_sample(void)
+{
+    return alarm.phase == ALARM_STATE_IDLE && watch_settings_play_sample(normal_volume);
+}
+
+static enum watch_menu_contact_result menu_add_contact(const char *phone)
+{
+    if (!watch_valid_phone(phone))
+        return MENU_CONTACT_INVALID;
+
+    rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
+    enum watch_menu_contact_result result = MENU_CONTACT_FULL;
+    struct persisted next = stored;
+    unsigned free_slot = WATCH_MAX_CONTACTS;
+    for (unsigned i = 0; i < WATCH_MAX_CONTACTS; ++i) {
+        if (strcmp(next.contacts[i], phone) == 0) {
+            result = MENU_CONTACT_DUPLICATE;
+            break;
+        }
+        if (!next.contacts[i][0] && free_slot == WATCH_MAX_CONTACTS)
+            free_slot = i;
+    }
+    if (result == MENU_CONTACT_FULL && free_slot < WATCH_MAX_CONTACTS) {
+        memcpy(next.contacts[free_slot], phone, strlen(phone) + 1);
+        if (save(&next)) {
+            stored = next;
+            result = MENU_CONTACT_SAVED;
+        } else {
+            result = MENU_CONTACT_SAVE_FAILED;
+        }
+    }
+    rt_mutex_release(&store_mutex);
+    return result;
+}
+
+static unsigned menu_wallpaper_count(void) { return g_wallpaper_count; }
+static unsigned menu_wallpaper_index(void) { return wallpaper_idx; }
+static const char *menu_wallpaper_name(unsigned index) { return g_wallpaper_names[index]; }
+static const lv_img_dsc_t *menu_wallpaper_image(unsigned index) { return g_wallpapers[index]; }
+
+static void navigate_menu(enum watch_menu_page page)
+{
+    requested_menu = page;
+    requested_page = page == MENU_NONE ? PAGE_FUNCTION : PAGE_MENU;
+}
+
+static void go_back_from_help(lv_event_t *event)
+{
+    (void)event;
+    requested_page = PAGE_DIAL;
+}
+
+static void finish_swipe(void)
+{
+    if (touch_page != visible_page || !swipe_direction)
+        return;
+    if (touch_page == PAGE_FUNCTION) {
+        if (swipe_direction < 0)
+            navigate_menu(MENU_FUNCTIONS);
+        else
+            requested_page = PAGE_DIAL;
+    } else if (touch_page == PAGE_MENU && swipe_direction > 0) {
+        navigate_menu(watch_menu_parent(menu_page));
+    }
+}
+
+static void read_touch(lv_indev_t *input, lv_indev_data_t *data)
+{
+    original_touch_read(input, data);
+    if (data->state == LV_INDEV_STATE_RELEASED) {
+        if (touch_down)
+            finish_swipe();
+        touch_down = false;
+        return;
+    }
+    if (!touch_down) {
+        touch_down = true;
+        touch_page = visible_page;
+        touch_origin = data->point;
+        swipe_direction = 0;
+        touch_moved = false;
+        touch_axis = SWIPE_UNDECIDED;
+        if (touch_page == PAGE_MENU) {
+            lv_point_t point = data->point;
+            if (watch_menu_blocks_swipe(lv_indev_search_obj(screen, &point)))
+                touch_axis = SWIPE_CONTROL;
+        }
+        return;
+    }
+    if (touch_page != visible_page || (touch_page != PAGE_FUNCTION && touch_page != PAGE_MENU) ||
+        touch_axis == SWIPE_CONTROL || swipe_direction)
+        return;
+
+    int delta_x = data->point.x - touch_origin.x;
+    int delta_y = data->point.y - touch_origin.y;
+    int distance_x = LV_ABS(delta_x);
+    int distance_y = LV_ABS(delta_y);
+    if (distance_x >= SWIPE_AXIS_PIXELS || distance_y >= SWIPE_AXIS_PIXELS)
+        touch_moved = true;
+    if (touch_axis == SWIPE_UNDECIDED) {
+        if (distance_x >= SWIPE_AXIS_PIXELS && distance_x * 4 >= distance_y * 5)
+            touch_axis = SWIPE_HORIZONTAL;
+        else if (distance_y >= SWIPE_AXIS_PIXELS && distance_y * 4 >= distance_x * 5)
+            touch_axis = SWIPE_VERTICAL;
+    }
+    if (touch_axis == SWIPE_HORIZONTAL && distance_x >= SWIPE_PAGE_PIXELS) {
+        swipe_direction = delta_x > 0 ? 1 : -1;
+        lv_indev_wait_release(input);
+    }
+}
+
+static void suppress_drag_click(lv_event_t *event)
+{
+    if (touch_page == visible_page && (touch_page == PAGE_FUNCTION || touch_page == PAGE_MENU) &&
+        touch_moved && touch_axis != SWIPE_CONTROL)
+        lv_indev_stop_processing(lv_event_get_current_target(event));
+}
+
+static lv_obj_t *dial_shade(int top, int height)
+{
+    lv_obj_t *shade = lv_obj_create(wallpaper);
+    lv_obj_remove_style_all(shade);
+    lv_obj_remove_flag(shade, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(shade, lv_pct(100), height);
+    lv_obj_align(shade, LV_ALIGN_TOP_MID, 0, top);
+    lv_obj_set_style_bg_color(shade, lv_color_black(), 0);
+    return shade;
+}
+
 static void init_ui(void)
 {
     if (littlevgl2rtt_init("lcd") != RT_EOK)
         return;
     lcd = rt_device_find("lcd");
+    if (panel_brightness != WATCH_PANEL_BRIGHTNESS && !set_panel_brightness(panel_brightness))
+        rt_kprintf("WATCH_DISPLAY brightness=%u error\n", (unsigned)panel_brightness);
     screen = lv_screen_active();
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     wallpaper = lv_obj_create(screen);
     lv_obj_remove_style_all(wallpaper);
     lv_obj_set_size(wallpaper, lv_pct(100), lv_pct(100));
     lv_obj_remove_flag(wallpaper, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(wallpaper, lv_color_hex(0x102038), 0);
-    lv_obj_set_style_bg_grad_color(wallpaper, lv_color_hex(0x2a3f5f), 0);
-    lv_obj_set_style_bg_grad_dir(wallpaper, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_opa(wallpaper, LV_OPA_COVER, 0);
-    dial_date = label(wallpaper, 57, &watch_dial_date, 0xffffff);
-    lv_obj_t *clock_row = lv_obj_create(wallpaper);
+    wallpaper_image = lv_img_create(wallpaper);
+    lv_img_set_src(wallpaper_image, g_wallpapers[wallpaper_idx]);
+    lv_obj_center(wallpaper_image);
+    lv_obj_set_style_bg_opa(dial_shade(0, 205), LV_OPA_60, 0);
+    lv_obj_t *fade = dial_shade(205, 78);
+    lv_obj_set_style_bg_opa(fade, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_grad_color(fade, lv_color_black(), 0);
+    lv_obj_set_style_bg_grad_dir(fade, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_main_opa(fade, LV_OPA_60, 0);
+    lv_obj_set_style_bg_grad_opa(fade, LV_OPA_TRANSP, 0);
+    dial_date_shadow = label(wallpaper, 55, &watch_dial_date, 0x000000);
+    lv_obj_set_style_text_opa(dial_date_shadow, LV_OPA_60, 0);
+    dial_date = label(wallpaper, 53, &watch_dial_date, 0xffffff);
+    clock_row = lv_obj_create(wallpaper);
+    lv_obj_add_flag(clock_row, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(dial_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(dial_date_shadow, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_style_all(clock_row);
     lv_obj_remove_flag(clock_row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(clock_row, 364, 200);
-    lv_obj_align(clock_row, LV_ALIGN_TOP_MID, 0, 105);
+    lv_obj_set_size(clock_row, 368, 118);
+    lv_obj_align(clock_row, LV_ALIGN_TOP_MID, 0, 91);
     int x = 0;
     for (unsigned i = 0; i < 5; ++i) {
         const int width = i == 2 ? 32 : 83;
+        digit_shadows[i] = label(clock_row, 0, &watch_dial_digits, 0x000000);
+        lv_obj_set_style_text_opa(digit_shadows[i], LV_OPA_60, 0);
+        lv_obj_set_width(digit_shadows[i], width);
+        lv_obj_align(digit_shadows[i], LV_ALIGN_LEFT_MID, x + 2, 3);
         dial_digits[i] = label(clock_row, 0, &watch_dial_digits, 0xffffff);
         lv_obj_set_width(dial_digits[i], width);
         lv_obj_align(dial_digits[i], LV_ALIGN_LEFT_MID, x, 0);
@@ -540,14 +825,25 @@ static void init_ui(void)
     action_label = label(action, 0, font, 0xffffff);
     lv_obj_set_width(action_label, 270);
     lv_obj_center(action_label);
-    sync_hint = lv_obj_create(screen);
-    lv_obj_remove_style_all(sync_hint);
-    lv_obj_remove_flag(sync_hint, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(sync_hint, 7, 7);
-    lv_obj_align(sync_hint, LV_ALIGN_TOP_RIGHT, -37, 45);
-    lv_obj_set_style_radius(sync_hint, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(sync_hint, lv_color_hex(0xffcb91), 0);
-    lv_obj_set_style_bg_opa(sync_hint, LV_OPA_COVER, 0);
+    clock_placeholder = label(wallpaper, 123, &lv_font_montserrat_48, 0xffffff);
+    lv_label_set_text(clock_placeholder, "--:--");
+    wallpaper_button = lv_button_create(screen);
+    lv_obj_set_size(wallpaper_button, 340, 56);
+    lv_obj_align(wallpaper_button, LV_ALIGN_TOP_MID, 0, 383);
+    lv_obj_set_style_radius(wallpaper_button, 18, 0);
+    lv_obj_set_style_bg_color(wallpaper_button, lv_color_hex(0x263e5a), 0);
+    lv_obj_add_event_cb(wallpaper_button, request_wallpaper, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_t *wallpaper_label = label(wallpaper_button, 0, &watch_wallpaper_font, 0xffffff);
+    lv_obj_set_width(wallpaper_label, LV_SIZE_CONTENT);
+    lv_obj_align(wallpaper_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_label_set_text(wallpaper_label, "切换壁纸");
+    wallpaper_status = label(wallpaper_button, 0, &watch_wallpaper_font, 0xe0ebff);
+    lv_obj_set_width(wallpaper_status, 180);
+    lv_obj_set_style_text_align(wallpaper_status, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(wallpaper_status, LV_LABEL_LONG_DOT);
+    lv_obj_align(wallpaper_status, LV_ALIGN_RIGHT_MID, 0, 0);
+    show_wallpaper_selection();
+    lv_obj_add_flag(wallpaper_button, LV_OBJ_FLAG_HIDDEN);
     resolve_arc = lv_arc_create(screen);
     lv_obj_set_size(resolve_arc, 210, 210);
     lv_obj_center(resolve_arc);
@@ -567,6 +863,38 @@ static void init_ui(void)
     lv_obj_center(resolve_percent);
     resolve_text = label(screen, 355, font, 0xffffff);
     lv_obj_add_flag(resolve_text, LV_OBJ_FLAG_HIDDEN);
+    help_back = lv_button_create(screen);
+    lv_obj_set_size(help_back, 64, 48);
+    lv_obj_align(help_back, LV_ALIGN_TOP_LEFT, 22, 11);
+    lv_obj_set_style_bg_color(help_back, lv_color_hex(0x253332), 0);
+    lv_obj_set_style_radius(help_back, 15, 0);
+    lv_obj_add_event_cb(help_back, go_back_from_help, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(help_back);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_center(back_icon);
+    lv_obj_add_flag(help_back, LV_OBJ_FLAG_HIDDEN);
+    static const struct watch_menu_ops operations = {
+        .navigate = navigate_menu,
+        .add_contact = menu_add_contact,
+        .get_level = menu_get_level,
+        .set_level = menu_set_level,
+        .play_sample = menu_play_sample,
+        .wallpaper_count = menu_wallpaper_count,
+        .get_wallpaper = menu_wallpaper_index,
+        .wallpaper_name = menu_wallpaper_name,
+        .wallpaper_thumbnail = menu_wallpaper_image,
+        .apply_wallpaper = apply_wallpaper,
+    };
+    watch_menu_init(screen, &operations);
+    for (lv_indev_t *input = lv_indev_get_next(NULL); input; input = lv_indev_get_next(input)) {
+        if (lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER) {
+            original_touch_read = lv_indev_get_read_cb(input);
+            lv_indev_set_read_cb(input, read_touch);
+            lv_indev_add_event_cb(input, suppress_drag_click, LV_EVENT_SHORT_CLICKED, NULL);
+            lv_indev_add_event_cb(input, suppress_drag_click, LV_EVENT_CLICKED, NULL);
+            break;
+        }
+    }
 }
 
 static void update_label(lv_obj_t *object, const char *text)
@@ -586,6 +914,7 @@ static void set_visible(lv_obj_t *object, bool visible)
 static bool update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
 {
     static bool initialized, raw, stable, consumed, vbus;
+    static bool woke_screen;
     static uint32_t changed, down_since, power_changed;
     const bool pressed = rt_pin_read(KEY1) == PIN_HIGH;
     const bool usb = rt_pin_read(VBUS_DET) == PIN_HIGH;
@@ -598,19 +927,21 @@ static bool update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
         return false;
     }
 
-    if (usb != vbus) {
+    const bool power_changed_now = usb != vbus;
+    if (power_changed_now) {
         vbus = usb;
         power_changed = now;
-        consumed |= raw || stable || pressed;
         rt_kprintf("WATCH_POWER vbus=%d battery=%s\n", usb, usb ? "unknown" : "only");
     }
     if (raw != pressed) {
         raw = pressed;
         changed = now;
     }
-    if (alarm_active && (stable || raw) && !consumed) {
-        consumed = true;
-        rt_kprintf("WATCH_KEY1 ignored=alarm\n");
+    if (alarm_active || power_changed_now) {
+        if (key1_power != KEY1_POWER_IDLE || (!consumed && (stable || raw)))
+            rt_kprintf("WATCH_KEY1 power=cancel reason=%s\n", alarm_active ? "alarm" : "supply");
+        key1_power = KEY1_POWER_IDLE;
+        consumed |= raw || stable;
     }
     bool activity = false;
     if (stable != raw && now - changed >= KEY1_DEBOUNCE_MS) {
@@ -619,13 +950,21 @@ static bool update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
             down_since = changed;
             consumed |= now - power_changed < KEY1_POWER_GUARD_MS;
             activity = !consumed;
-            if (!consumed && *page == PAGE_SLEEP) {
+            woke_screen = !consumed && *page == PAGE_SLEEP;
+            if (woke_screen)
                 *page = PAGE_DIAL;
-                consumed = true;
-            }
         } else {
-            uint32_t held = changed - down_since;
-            if (!consumed && held < KEY1_SHORT_MS) {
+            const uint32_t held = changed - down_since;
+            if (!consumed && held >= KEY1_LONG_MS) {
+                key1_power = KEY1_POWER_CONFIRMED;
+                key1_power_progress = 1000u;
+                key1_power_confirmed_at = now;
+                rt_kprintf("WATCH_KEY1 power=confirmed ms=%u\n", (unsigned)held);
+            } else if (key1_power == KEY1_POWER_HOLDING) {
+                key1_power = KEY1_POWER_IDLE;
+                activity = true;
+                rt_kprintf("WATCH_KEY1 power=cancel reason=release ms=%u\n", (unsigned)held);
+            } else if (key1_power == KEY1_POWER_IDLE && !consumed && !woke_screen && held < KEY1_SHORT_MS) {
                 *page = *page == PAGE_DIAL ? PAGE_FUNCTION : PAGE_DIAL;
                 rt_kprintf("WATCH_KEY1 short ms=%u\n", (unsigned)held);
             }
@@ -634,15 +973,32 @@ static bool update_key1(enum watch_page *page, bool alarm_active, uint32_t now)
     } else if (!stable && !raw && now - changed >= KEY1_DEBOUNCE_MS) {
         consumed = false;
     }
-    if (stable && raw && !consumed && now - down_since >= KEY1_LONG_MS) {
-        consumed = true;
-        if (*page != PAGE_SLEEP) {
-            *page = PAGE_SLEEP;
-            rt_kprintf("WATCH_KEY1 long mode=monitor_sleep vbus=%d battery=%s\n",
-                       vbus, vbus ? "unknown" : "only");
+    if (stable && raw && !consumed && key1_power != KEY1_POWER_CONFIRMED) {
+        const uint32_t held = now - down_since;
+        if (held >= KEY1_LONG_MS) {
+            key1_power = KEY1_POWER_CONFIRMED;
+            key1_power_progress = 1000u;
+            key1_power_confirmed_at = now;
+            consumed = true;
+            rt_kprintf("WATCH_KEY1 power=confirmed ms=%u\n", (unsigned)held);
+        } else if (held >= KEY1_PROGRESS_MS) {
+            if (key1_power == KEY1_POWER_IDLE)
+                rt_kprintf("WATCH_KEY1 power=hold ms=%u\n", (unsigned)held);
+            key1_power = KEY1_POWER_HOLDING;
+            key1_power_progress = (held - KEY1_PROGRESS_MS) * 1000u / (KEY1_LONG_MS - KEY1_PROGRESS_MS);
         }
     }
-    return activity;
+    key1_released = !raw && !stable;
+    return activity || key1_power != KEY1_POWER_IDLE;
+}
+
+static void draw_hold_progress(uint32_t progress, const char *message)
+{
+    char value[8];
+    lv_arc_set_value(resolve_arc, (int32_t)progress);
+    rt_snprintf(value, sizeof(value), "%u%%", (unsigned)(progress / 10u));
+    update_label(resolve_percent, value);
+    update_label(resolve_text, message);
 }
 
 static void render(uint32_t now, enum watch_page next, unsigned pin, const char *power_reason)
@@ -650,16 +1006,18 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
     if (!title)
         return;
     const bool alarm_page = next == PAGE_ALARM;
+    const bool power_page = next == PAGE_POWER_HOLD;
     const bool counting = alarm_page && watch_alarm_counting(&alarm);
+    watch_menu_show(next == PAGE_MENU ? menu_page : MENU_NONE);
     if (visible_page != next) {
         static const char *const names[] = {
-            [PAGE_DIAL] = "dial", [PAGE_FUNCTION] = "function",
-            [PAGE_SLEEP] = "sleep", [PAGE_ALARM] = "alarm",
+            [PAGE_DIAL] = "dial", [PAGE_FUNCTION] = "function", [PAGE_MENU] = "menu",
+            [PAGE_SLEEP] = "sleep", [PAGE_ALARM] = "alarm", [PAGE_POWER_HOLD] = "power_hold",
         };
         if (visible_page == PAGE_SLEEP || next == PAGE_SLEEP) {
             /* Board-level LCD power-off also cuts the touchscreen's shared 3.3 V rail. */
-            uint8_t brightness = next == PAGE_SLEEP ? 0 : WATCH_PANEL_BRIGHTNESS;
-            if (!lcd || rt_device_control(lcd, RTGRAPHIC_CTRL_SET_BRIGHTNESS, &brightness) != RT_EOK) {
+            uint8_t brightness = next == PAGE_SLEEP ? 0 : panel_brightness;
+            if (!set_panel_brightness(brightness)) {
                 rt_kprintf("WATCH_DISPLAY brightness=%u error\n", (unsigned)brightness);
                 return;
             }
@@ -667,6 +1025,8 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
                 lv_display_enable_invalidation(NULL, false);
                 lv_timer_pause(lv_display_get_refr_timer(NULL));
                 set_visible(action, false);
+                set_visible(wallpaper_button, false);
+                set_visible(help_back, false);
             } else {
                 lv_display_enable_invalidation(NULL, true);
                 lv_obj_invalidate(screen);
@@ -685,36 +1045,38 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
         lv_obj_set_style_text_color(reading, lv_color_hex(alarm_page ? 0xffcb91 : 0xffffff), 0);
         lv_obj_set_style_bg_color(action, lv_color_hex(alarm_page ? 0x286354 : 0xa73732), 0);
         set_visible(wallpaper, next == PAGE_DIAL);
-        set_visible(title, next != PAGE_DIAL);
-        set_visible(reading, next != PAGE_DIAL);
-        set_visible(caption, next != PAGE_DIAL);
+        set_visible(wallpaper_button, next == PAGE_FUNCTION);
+        set_visible(help_back, next == PAGE_FUNCTION);
+        if (next == PAGE_FUNCTION)
+            show_wallpaper_selection();
+        set_visible(title, next == PAGE_FUNCTION || alarm_page);
+        set_visible(reading, next == PAGE_FUNCTION || alarm_page);
+        set_visible(caption, next == PAGE_FUNCTION || alarm_page);
     } else if (next == PAGE_SLEEP) {
         return;
     }
 
     const bool showing_hold = alarm_page && (alarm.holding || resolved_notice);
-    set_visible(resolve_arc, showing_hold);
-    set_visible(resolve_text, showing_hold);
+    set_visible(resolve_arc, showing_hold || power_page);
+    set_visible(resolve_text, showing_hold || power_page);
     if (alarm_page) {
         set_visible(reading, !showing_hold);
         set_visible(caption, !showing_hold);
     }
-    if (!showing_hold)
+    if (!showing_hold && !power_page)
         lv_arc_set_value(resolve_arc, 0);
     set_visible(action, next == PAGE_FUNCTION || counting);
-    set_visible(sync_hint, next == PAGE_DIAL && !watch_time_is_synced());
     char value[8];
     const bool notifying = notice && now - notice_started < NOTICE_MS;
-    if (showing_hold) {
+    if (power_page) {
+        draw_hold_progress(key1_power_progress, "长按关机");
+    } else if (showing_hold) {
         uint32_t progress = resolved_notice ? 1000u :
             (uint32_t)((uint64_t)(now - alarm.hold_started_ms) * 1000u / alarm.cfg->cancel_hold_ms);
         if (progress > 1000u)
             progress = 1000u;
-        lv_arc_set_value(resolve_arc, (int32_t)progress);
-        rt_snprintf(value, sizeof(value), "%u%%", (unsigned)(progress / 10u));
-        update_label(resolve_percent, value);
+        draw_hold_progress(progress, resolved_notice ? "已解除警报" : "长按解除警报");
         update_label(title, alarm.demo ? "演示提醒" : "求助");
-        update_label(resolve_text, resolved_notice ? "已解除警报" : "长按解除警报");
     } else if (counting) {
         rt_snprintf(value, sizeof(value), "%02u", watch_alarm_seconds(&alarm, now));
         update_label(title, alarm.demo || bench_alarm ? "演示提醒" : "疑似跌倒");
@@ -739,18 +1101,31 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
             update_label(caption, !imu_ok || now - sensor_seen > 500u ? "传感器异常" :
                                   notifying ? notice : "");
         }
+    } else if (next == PAGE_MENU) {
+        struct tm local;
+        char time[6] = "--:--";
+        if (watch_time_calendar(now, &local))
+            rt_snprintf(time, sizeof(time), "%02d:%02d", local.tm_hour, local.tm_min);
+        watch_menu_set_time(time);
     } else {
         static const char *const weekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
         struct tm local;
         char date[32], time[6];
-        if (watch_time_calendar(now, &local)) {
+        bool show_time = watch_time_calendar(now, &local);
+        set_visible(clock_placeholder, !show_time);
+        set_visible(dial_date, show_time);
+        set_visible(dial_date_shadow, show_time);
+        set_visible(clock_row, show_time);
+        if (show_time) {
             rt_snprintf(date, sizeof(date), "%d月%d日 周%s", local.tm_mon + 1,
                         local.tm_mday, weekdays[local.tm_wday]);
             rt_snprintf(time, sizeof(time), "%02d:%02d", local.tm_hour, local.tm_min);
             update_label(dial_date, date);
+            update_label(dial_date_shadow, date);
             for (unsigned i = 0; i < 5; ++i) {
                 const char digit[] = {time[i], '\0'};
                 update_label(dial_digits[i], digit);
+                update_label(digit_shadows[i], digit);
             }
         }
     }
@@ -759,6 +1134,7 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
 int main(void)
 {
     load_store();
+    load_ui_settings();
     watch_time_init(database_ready ? &database : NULL, &store_mutex, watch_now_ms());
     rt_pin_mode(KEY1, PIN_MODE_INPUT_PULLDOWN);
     rt_pin_mode(VBUS_DET, PIN_MODE_INPUT);
@@ -783,6 +1159,8 @@ int main(void)
     uint32_t manual_since = 0;
     unsigned last_pin = 1000000u;
     struct watch_wrist wrist = {0};
+    wrist_sleep_cfg_t wrist_cfg = wrist_defaults;
+    wrist_console_init();
     uint32_t last_activity = watch_now_ms();
     const char *power_reason = "startup";
     while (true) {
@@ -869,6 +1247,7 @@ int main(void)
         watch_motor(watch_alarm_vibrate(&alarm, now), alarm.cfg->vib_pwm_duty);
         uint32_t epoch;
         bool time_changed = watch_ble_time(&epoch);
+        const bool first_time_sync = time_changed && !watch_time_ready();
         if (time_changed)
             watch_time_sync(epoch, now);
         watch_time_poll(now);
@@ -882,6 +1261,29 @@ int main(void)
         }
         const enum watch_page from = page;
         const bool key1_activity = update_key1(&page, alarm_active || visible_page == PAGE_ALARM, now);
+        if (requested_page != PAGE_NONE) {
+            if (!alarm_active && page == from && page == visible_page &&
+                (page == PAGE_FUNCTION || page == PAGE_MENU) && key1_power == KEY1_POWER_IDLE) {
+                page = requested_page;
+                if (page == PAGE_MENU) {
+                    menu_page = requested_menu;
+                    rt_kprintf("WATCH_MENU page=%u\n", (unsigned)menu_page);
+                }
+                last_activity = now;
+                last_draw = now - 150u;
+            }
+            requested_page = PAGE_NONE;
+        }
+        const bool wrist_protected = alarm_active || visible_page == PAGE_ALARM;
+        enum wrist_event wrist_event = RW_EVT_NONE;
+        if (sample_ready) {
+            if (wrist_console_take_cfg(&wrist_cfg))
+                wrist = (struct watch_wrist){0};
+            enum wrist_screen mode = wrist_protected ? RW_SCREEN_PROTECTED :
+                                     page == PAGE_SLEEP ? RW_SCREEN_OFF : RW_SCREEN_ON;
+            wrist_event = watch_wrist_update(&wrist, &wrist_cfg, &sample, now, mode);
+            wrist_console_record(&sample, &wrist, wrist_event, now);
+        }
         if (alarm_active) {
             last_activity = now;
             power_reason = "alarm";
@@ -892,16 +1294,14 @@ int main(void)
             page = PAGE_DIAL;
             power_reason = "key2";
             last_activity = now;
-        } else if (from == PAGE_SLEEP && sample_ready && watch_wrist_update(&wrist, &sample, now)) {
-            page = PAGE_DIAL;
-            power_reason = "wrist";
-            last_activity = now;
         } else if (from != PAGE_SLEEP && page == PAGE_SLEEP) {
             power_reason = "key1";
+        } else if (!wrist_protected && !key1_activity && !key2_activity && wrist_event == RW_EVT_SLEEP_SCREEN) {
+            page = PAGE_SLEEP;
+            power_reason = "wrist_down";
         }
 
         if (page != PAGE_SLEEP) {
-            wrist = (struct watch_wrist){0};
             if (key1_activity || key2_activity || (sample_ready && (!recent_sample || !watch_wrist_still(&sample))))
                 last_activity = now;
         }
@@ -911,19 +1311,43 @@ int main(void)
             last_activity = now;
         }
         last_pin = pin;
+        if (first_time_sync && !wrist_protected) {
+            page = PAGE_DIAL;
+            last_activity = now;
+            power_reason = "ble_time";
+            rt_kprintf("WATCH_TIME_DISPLAY ready\n");
+        }
         if (title && page != PAGE_SLEEP && !alarm_active && sample_ready && now - last_activity >= WATCH_SCREEN_TIMEOUT_MS &&
                 lv_display_get_inactive_time(NULL) >= WATCH_SCREEN_TIMEOUT_MS) {
             page = PAGE_SLEEP;
             power_reason = "idle";
         }
+        const bool power_blank = key1_power == KEY1_POWER_CONFIRMED &&
+                                 now - key1_power_confirmed_at >= KEY1_FULL_FRAME_MS;
         enum watch_page next = alarm_active ? PAGE_ALARM : page;
+        if (!alarm_active && key1_power != KEY1_POWER_IDLE) {
+            next = power_blank ? PAGE_SLEEP : PAGE_POWER_HOLD;
+            power_reason = "key1_power";
+        }
         if (time_changed || next != visible_page || was_holding != alarm.holding ||
-                now - last_draw >= (alarm.holding ? HOLD_DRAW_MS : 150u)) {
+                now - last_draw >= (alarm.holding || key1_power != KEY1_POWER_IDLE ? HOLD_DRAW_MS : 150u)) {
             last_draw = now;
             render(now, next, pin, power_reason);
         }
         if (title)
             lv_timer_handler();
+        if (wallpaper_requested) {
+            wallpaper_requested = false;
+            if (next == PAGE_FUNCTION && !manual_requested &&
+                !apply_wallpaper((wallpaper_idx + 1u) % g_wallpaper_count))
+                lv_label_set_text(wallpaper_status, "保存失败");
+        }
+        if (power_blank && key1_released) {
+            /* The screen blanks at full progress. Start the high-level wake
+             * detector after this press ends so it cannot wake itself. */
+            key1_power = KEY1_POWER_IDLE;
+            watch_rtc_hibernate(rt_pin_read(VBUS_DET) == PIN_HIGH);
+        }
         rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
         bool sent_sos = outbox(now);
 #ifdef WATCH_SOS_RESOLVED_UPLINK

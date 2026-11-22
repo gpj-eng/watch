@@ -1,5 +1,6 @@
 #include "alarm.h"
 #include "protocol.h"
+#include "watch_wrist.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -75,9 +76,78 @@ static void test_alarm(void)
     assert(alarm.phase == ALARM_STATE_IDLE);
 }
 
+struct wrist_trial {
+    struct watch_wrist wrist;
+    wrist_sleep_cfg_t cfg;
+    uint32_t now;
+    enum wrist_screen screen;
+};
+
+static enum wrist_event frame(struct wrist_trial *t, struct watch_imu imu)
+{
+    t->now += 19;
+    return watch_wrist_update(&t->wrist, &t->cfg, &imu, t->now, t->screen);
+}
+
+static const struct watch_imu down = {.ax = 121, .ay = -994, .az = -129};
+static const struct watch_imu view = {.ax = -564, .ay = -132, .az = -803};
+
+static void quiet_frames(struct wrist_trial *t, struct watch_imu imu, unsigned n)
+{
+    for (unsigned i = 0; i < n; ++i)
+        assert(frame(t, imu) == RW_EVT_NONE);
+}
+
+static void before_wrist_sleep(struct wrist_trial *t)
+{
+    quiet_frames(t, view, 20);
+    for (unsigned i = 0; i < 30 && t->wrist.count < t->cfg.sleep_frames - 1u; ++i)
+        assert(frame(t, down) == RW_EVT_NONE);
+    assert(t->wrist.count == t->cfg.sleep_frames - 1u);
+}
+
+static void test_wrist_sleep(void)
+{
+    struct wrist_trial t = {.cfg = wrist_defaults, .now = UINT32_MAX - 450u};
+    /* A former wake gesture has no effect with the display off. */
+    for (int sign = -1; sign <= 1; sign += 2) {
+        struct watch_imu turn = down;
+        turn.gy = sign * 1100;
+        quiet_frames(&t, down, 20);
+        quiet_frames(&t, turn, 1);
+        quiet_frames(&t, view, 35);
+    }
+
+    /* A key can wake the watch while the wrist is already down. */
+    t.screen = RW_SCREEN_ON;
+    quiet_frames(&t, down, 40);
+    before_wrist_sleep(&t);
+    assert(frame(&t, down) == RW_EVT_SLEEP_SCREEN);
+
+    t.screen = RW_SCREEN_OFF;
+    quiet_frames(&t, down, 20);
+    t.screen = RW_SCREEN_ON;
+    before_wrist_sleep(&t);
+    t.now += 45;
+    quiet_frames(&t, down, 20);
+    assert(t.wrist.count == 0);
+
+    /* An alarm arriving on the last frame keeps its page visible. */
+    before_wrist_sleep(&t);
+    t.screen = RW_SCREEN_PROTECTED;
+    quiet_frames(&t, down, 60);
+    quiet_frames(&t, view, 30);
+    quiet_frames(&t, down, 60);
+    t.screen = RW_SCREEN_ON;
+    quiet_frames(&t, down, 60);
+    before_wrist_sleep(&t);
+    assert(frame(&t, down) == RW_EVT_SLEEP_SCREEN);
+}
+
 int main(void)
 {
     test_alarm();
+    test_wrist_sleep();
     struct watch_detector detector = {0};
     const struct watch_imu still = {.az = 1000}, impact = {.ax = 3400, .gx = 2500}, settled = {.ay = 1000};
     for (unsigned i = 0; i < 20; ++i)
@@ -119,6 +189,6 @@ int main(void)
     assert(!memcmp(frame, resolved_frame, sizeof(resolved_frame)));
     assert(!watch_frame_resolved(frame, 0, device, 0));
 
-    puts("PASS alarm timings, hold and release, synthetic fall, and SOS/resolved frames");
+    puts("PASS alarm timings, hold and release, synthetic fall, display sleep, and SOS/resolved frames");
     return 0;
 }

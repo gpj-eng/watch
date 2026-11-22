@@ -12,6 +12,7 @@ void watch_voice_set(enum watch_voice_mode mode);
 enum watch_alarm_event watch_voice_take_event(void);
 void watch_ble_init(void);
 void watch_ble_poll(void);
+bool watch_ble_connected(void);
 bool watch_ble_ready(void);
 bool watch_ble_send(uint8_t frame[WATCH_FRAME_SIZE]);
 bool watch_ble_ack(uint8_t *type, uint64_t *id, uint8_t *status);

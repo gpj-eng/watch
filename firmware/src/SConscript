@@ -1,6 +1,34 @@
 from building import *
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 cwd = GetCurrentDir()
-src = [f for f in Glob('*.c') if f.name != 'lcpu_img.c']
+src = [f for f in Glob('*.c') if f.name not in ('lcpu_img.c', 'watch_wallpapers_generated.c')]
+firmware = Path(cwd).parent
+wallpapers = firmware / 'assets' / 'wallpapers'
+wallpaper_tool = firmware / 'tools' / 'convert_wallpapers.py'
+env = GetCurrentEnv()
+ezip = Path(os.environ['SIFLI_SDK']) / 'tools' / 'png2ezip' / ('ezip' + env['tool_suffix'])
+
+
+def build_wallpapers(target, source, env):
+    return subprocess.run([
+        sys.executable, source[0].abspath,
+        '--ezip', source[1].abspath,
+        '--input', str(wallpapers),
+        '--out', target[0].abspath,
+    ]).returncode
+
+
+inputs = [str(wallpaper_tool), str(ezip)]
+inputs.extend(str(image) for image in sorted(wallpapers.glob('*.png')))
+names = wallpapers / 'wallpapers.json'
+if names.is_file():
+    inputs.append(str(names))
+
+src.extend(env.Command('watch_wallpapers_generated.c', inputs,
+                       Action(build_wallpapers, 'EZIP     $TARGET')))
 group = DefineGroup('Huangshan SOS Watch', src, CPPPATH=[cwd], depend=[''])
 Return('group')

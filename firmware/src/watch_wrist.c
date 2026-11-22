@@ -1,77 +1,66 @@
 #include "watch_wrist.h"
+#include <math.h>
 #include <rtconfig.h>
 
-#define WRIST_MAX_SAMPLE_GAP_MS 100u
-#define WRIST_TURN_WINDOW_MS 800u
-#define WRIST_FAST_SAMPLES 2u
-#define WRIST_STEADY_SAMPLES 8u
+const wrist_sleep_cfg_t wrist_defaults = {
+    .alpha = 0.20f, .view_z_g = 0.70f, .view_forearm_max_g = 0.65f, .sleep_z_g = 0.35f,
+    .max_gap_ms = 35, .sleep_frames = 16, .forearm = WRIST_FOREARM_Y,
+};
 
-static uint32_t squared(int32_t value)
+static float norm_sq(float x, float y, float z)
 {
-    return (uint32_t)(value * value);
+    return x*x + y*y + z*z;
 }
 
-static uint32_t accel_squared(const struct watch_imu *sample)
-{
-    return squared(sample->ax) + squared(sample->ay) + squared(sample->az);
-}
-
-static uint32_t gyro_squared(const struct watch_imu *sample)
-{
-    return squared(sample->gx) + squared(sample->gy) + squared(sample->gz);
-}
-
-int32_t watch_wrist_face_up_mg(const struct watch_imu *sample)
+int32_t watch_wrist_face_up_mg(const struct watch_imu *s)
 {
 #ifdef WATCH_DIAL_FACE_UP_NEGATIVE_Z
-    return -sample->az;
+    return -(int32_t)s->az;
 #else
-    return sample->az;
+    return s->az;
 #endif
 }
 
-static bool within_tilt(const struct watch_imu *sample, uint32_t accel, unsigned cos_squared_milli)
+bool watch_wrist_still(const struct watch_imu *s)
 {
-    const int32_t up = watch_wrist_face_up_mg(sample);
-    return up > 0 && (uint64_t)squared(up) * 1000u >= (uint64_t)accel * cos_squared_milli;
+    float a2 = norm_sq(s->ax, s->ay, s->az);
+    return a2 >= 900.f*900.f && a2 <= 1100.f*1100.f && norm_sq(s->gx, s->gy, s->gz) <= 120.f*120.f;
 }
 
-bool watch_wrist_still(const struct watch_imu *sample)
+static void sync_screen(struct watch_wrist *w, enum wrist_screen screen)
 {
-    const uint32_t accel = accel_squared(sample);
-    return accel >= 900u * 900u && accel <= 1100u * 1100u &&
-           gyro_squared(sample) <= 120u * 120u;
+    w->count = 0;
+    w->viewed = false;
+    w->screen = screen;
 }
 
-bool watch_wrist_update(struct watch_wrist *wrist, const struct watch_imu *sample, uint32_t now)
+enum wrist_event watch_wrist_update(struct watch_wrist *w, const wrist_sleep_cfg_t *cfg,
+                                    const struct watch_imu *s, uint32_t now, enum wrist_screen screen)
 {
-    if ((wrist->have_sample && now - wrist->last_sample_ms > WRIST_MAX_SAMPLE_GAP_MS) ||
-        (wrist->turning && now - wrist->started_ms > WRIST_TURN_WINDOW_MS))
-        *wrist = (struct watch_wrist){0};
-    wrist->have_sample = true;
-    wrist->last_sample_ms = now;
+    const bool gap = !w->initialized || now - w->last_ms > cfg->max_gap_ms;
+    const float g[] = {s->ax / 1000.f, s->ay / 1000.f, watch_wrist_face_up_mg(s) / 1000.f};
+    for (unsigned i = 0; i < 3; ++i)
+        w->gravity[i] = gap ? g[i] : w->gravity[i] + cfg->alpha * (g[i] - w->gravity[i]);
+    if (gap || w->screen != screen)
+        sync_screen(w, screen);
+    w->initialized = true;
+    w->last_ms = now;
 
-    const uint32_t accel = accel_squared(sample);
-    if (!wrist->turning) {
-        if (watch_wrist_still(sample))
-            wrist->armed = !within_tilt(sample, accel, 329u); /* cos²(55°) × 1000 */
-        if (!wrist->armed || squared(sample->gx) + squared(sample->gy) < 800u * 800u) {
-            wrist->fast_samples = 0;
-            return false;
+    if (screen != RW_SCREEN_ON)
+        return RW_EVT_NONE;
+
+    const float z = w->gravity[2];
+    const bool view = z >= cfg->view_z_g && fabsf(w->gravity[cfg->forearm]) <= cfg->view_forearm_max_g;
+    /* A key can wake the face while the wrist is already down.
+       Require a transition away from a viewing pose before putting it back to sleep. */
+    w->viewed |= view;
+    if (w->viewed && z <= cfg->sleep_z_g) {
+        if (++w->count >= cfg->sleep_frames) {
+            sync_screen(w, RW_SCREEN_OFF);
+            return RW_EVT_SLEEP_SCREEN;
         }
-        if (++wrist->fast_samples < WRIST_FAST_SAMPLES)
-            return false;
-        wrist->turning = true;
-        wrist->started_ms = now;
+    } else {
+        w->count = 0;
     }
-
-    if (accel < 800u * 800u || accel > 1200u * 1200u ||
-        gyro_squared(sample) > 180u * 180u || !within_tilt(sample, accel, 587u)) { /* cos²(40°) × 1000 */
-        wrist->steady_samples = 0;
-        return false;
-    }
-    if (++wrist->steady_samples < WRIST_STEADY_SAMPLES)
-        return false;
-    *wrist = (struct watch_wrist){0};
-    return true;
+    return RW_EVT_NONE;
 }

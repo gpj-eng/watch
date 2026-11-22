@@ -208,6 +208,11 @@ void watch_ble_poll(void)
     }
 }
 
+bool watch_ble_connected(void)
+{
+    return conn != 0xff;
+}
+
 bool watch_ble_ready(void)
 {
     return svc_handle && conn != 0xff && authenticated && cccd;
