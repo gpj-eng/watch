@@ -99,7 +99,8 @@ static void capture(unsigned seconds, const char *hand, const char *pose)
                        (unsigned)row.ms, s->ax, s->ay, s->az, s->gx, s->gy, s->gz,
                        row.filtered_mg[0], row.filtered_mg[1], row.filtered_mg[2],
                        row.screen == RW_SCREEN_OFF ? "IDLE" : "AWAKE", row.count, row.screen,
-                       row.event == RW_EVT_SLEEP_SCREEN ? "SLEEP" : "-");
+                       row.event == RW_EVT_SLEEP_SCREEN ? "SLEEP" :
+                       row.event == RW_EVT_WAKE_SCREEN ? "WAKE" : "-");
         }
         ++n;
     }

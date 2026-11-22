@@ -5,10 +5,12 @@
 #include "watch_wallpapers.h"
 #include "watch_menu.h"
 #include "watch_settings_audio.h"
+#include "watch_battery.h"
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <finsh.h>
 #include <flashdb.h>
+#include <stddef.h>
 #include <fal.h>
 #include <string.h>
 #include <littlevgl2rtt.h>
@@ -16,7 +18,6 @@
 LV_FONT_DECLARE(watch_cjk);
 LV_FONT_DECLARE(watch_dial_date);
 LV_FONT_DECLARE(watch_dial_digits);
-LV_FONT_DECLARE(watch_wallpaper_font);
 
 #define KEY1 WATCH_POWER_KEY_PIN
 #define KEY2 43
@@ -38,7 +39,9 @@ LV_FONT_DECLARE(watch_wallpaper_font);
 #define MAX_RESOLUTIONS 8
 #define RESOLVED_NOTICE_MS 2000u
 #define HOLD_DRAW_MS 25u
-#define STORE_VERSION 0x48530201u
+#define STORE_VERSION_LEGACY 0x48530201u
+#define STORE_VERSION 0x48530202u
+#define CONTACT_MASK ((1u << WATCH_MAX_CONTACTS) - 1u)
 #define WALLPAPER_KEY "wallpaper_idx"
 #define BRIGHTNESS_KEY "ui_brightness"
 #define VOLUME_KEY "ui_volume"
@@ -46,12 +49,14 @@ LV_FONT_DECLARE(watch_wallpaper_font);
 #define DEFAULT_VOLUME 60u
 #define SWIPE_AXIS_PIXELS 12
 #define SWIPE_PAGE_PIXELS 30
+#define WEATHER_VALID_SECONDS 7200u
 
 struct persisted {
     uint32_t version;
     uint64_t sequence;
     char contacts[WATCH_MAX_CONTACTS][WATCH_PHONE_SIZE];
     struct watch_sos pending[MAX_PENDING];
+    uint8_t emergency_mask;
 };
 
 struct resolution {
@@ -73,7 +78,12 @@ static struct watch_alarm alarm = {.cfg = &alarm_cfg_default};
 static struct watch_detector detector;
 static struct rt_event key_wake;
 static volatile uint32_t key_edge_ms;
-static volatile uint8_t demo_requested;
+enum demo_mode {
+    DEMO_NONE = 0,
+    DEMO_SOS = 1,
+    DEMO_BENCH = 2,
+};
+static volatile enum demo_mode demo_requested;
 static volatile bool pose_requested;
 static volatile uint32_t samples_read;
 static bool bench_alarm;
@@ -87,12 +97,11 @@ static uint32_t key1_power_progress, key1_power_confirmed_at;
 static bool key1_released;
 static enum watch_page visible_page;
 static lv_obj_t *screen, *wallpaper, *title, *reading, *caption, *action, *action_label;
-static lv_obj_t *wallpaper_image, *wallpaper_button, *wallpaper_status;
+static lv_obj_t *wallpaper_image;
 static lv_obj_t *help_back;
 static lv_obj_t *dial_date, *dial_date_shadow, *clock_row, *dial_digits[5], *digit_shadows[5];
 static lv_obj_t *clock_placeholder;
 static uint8_t wallpaper_idx;
-static bool wallpaper_requested;
 static uint8_t panel_brightness = WATCH_PANEL_BRIGHTNESS, saved_brightness = WATCH_PANEL_BRIGHTNESS;
 static uint8_t normal_volume = DEFAULT_VOLUME, saved_volume = DEFAULT_VOLUME;
 static enum watch_menu_page menu_page, requested_menu;
@@ -137,10 +146,16 @@ static void load_store(void)
     store_ok = database_ready;
     if (store_ok) {
         size_t length = fdb_kv_get_blob(&database, "state", fdb_blob_make(&blob, &loaded, sizeof(loaded)));
-        if (length == sizeof(loaded) && loaded.version == STORE_VERSION)
+        if (length == sizeof(loaded) && blob.saved.len == length && loaded.version == STORE_VERSION) {
             stored = loaded;
-        else if (length != 0)
+        } else if (length == offsetof(struct persisted, emergency_mask) && loaded.version == STORE_VERSION_LEGACY) {
+            /* Every contact in the previous layout was an emergency recipient. */
+            loaded.version = STORE_VERSION;
+            loaded.emergency_mask = CONTACT_MASK;
+            stored = loaded;
+        } else if (length != 0) {
             store_ok = false;
+        }
     }
     if (database_ready) {
         struct resolution loaded_resolutions[MAX_RESOLUTIONS] = {0};
@@ -209,6 +224,7 @@ static void watch_contacts(int argc, char **argv)
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
     struct persisted next = stored;
     memset(next.contacts, 0, sizeof(next.contacts));
+    next.emergency_mask = (1u << count) - 1u;
     for (int i = 0; i < count; ++i)
         memcpy(next.contacts[i], argv[i + 1], strlen(argv[i + 1]) + 1);
     bool ok = save(&next);
@@ -221,7 +237,7 @@ MSH_CMD_EXPORT(watch_contacts, Save emergency contacts to watch flash);
 
 static void watch_demo(void)
 {
-    demo_requested = 1;
+    demo_requested = DEMO_SOS;
 }
 MSH_CMD_EXPORT(watch_demo, Run local alarm demo without sending SOS);
 
@@ -233,7 +249,7 @@ MSH_CMD_EXPORT(watch_pose, Print the next IMU sample and signed face-up accelera
 
 static void watch_bench(void)
 {
-    demo_requested = 2;
+    demo_requested = DEMO_BENCH;
 }
 MSH_CMD_EXPORT(watch_bench, Run an SOS exercise with reserved contacts only);
 
@@ -271,12 +287,17 @@ static uint64_t submit(uint32_t now)
     uint64_t committed = 0;
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
     struct persisted next = stored;
+    struct watch_sos recipients = {.reason = alarm.reason};
+    for (unsigned i = 0; i < WATCH_MAX_CONTACTS; ++i) {
+        if ((next.emergency_mask & (1u << i)) && next.contacts[i][0])
+            memcpy(recipients.phones[recipients.count++], next.contacts[i], WATCH_PHONE_SIZE);
+    }
     unsigned slot = 0;
     while (slot < MAX_PENDING && next.pending[slot].id)
         ++slot;
     if (bench_alarm) {
-        for (unsigned i = 0; i < WATCH_MAX_CONTACTS && next.contacts[i][0]; ++i) {
-            const char *p = next.contacts[i];
+        for (unsigned i = 0; i < recipients.count; ++i) {
+            const char *p = recipients.phones[i];
             if (strlen(p) != 12 || memcmp(p, "+1202555010", 11) != 0 || p[11] < '0' || p[11] > '2') {
                 rt_kprintf("WATCH_BENCH requires reserved test contacts\n");
                 rt_mutex_release(&store_mutex);
@@ -284,17 +305,14 @@ static uint64_t submit(uint32_t now)
             }
         }
     }
-    if (!next.contacts[0][0]) {
+    if (!recipients.count) {
         show_notice("请设置联系人", now);
     } else if (slot == MAX_PENDING) {
         show_notice("求助队列已满", now);
     } else {
         struct watch_sos *item = &next.pending[slot];
-        *item = (struct watch_sos){.id = ++next.sequence, .reason = alarm.reason};
-        for (unsigned i = 0; i < WATCH_MAX_CONTACTS && next.contacts[i][0]; ++i) {
-            memcpy(item->phones[i], next.contacts[i], WATCH_PHONE_SIZE);
-            ++item->count;
-        }
+        *item = recipients;
+        item->id = ++next.sequence;
         if (save(&next)) {
             stored = next;
             committed = item->id;
@@ -457,6 +475,7 @@ static void handle_alarm_event(enum watch_alarm_event event, uint32_t now)
     }
 }
 
+/* Returns true when a SOS frame went out, so the caller withholds this tick's IMU frame. */
 static bool outbox(uint32_t now)
 {
     static uint32_t retry;
@@ -557,7 +576,7 @@ static void action_pressed(lv_event_t *e)
     }
 }
 
-static lv_obj_t *label(lv_obj_t *parent, int y, const lv_font_t *font, uint32_t color)
+static lv_obj_t *centered_label(lv_obj_t *parent, int y, const lv_font_t *font, uint32_t color)
 {
     lv_obj_t *obj = lv_label_create(parent);
     lv_obj_set_width(obj, 330);
@@ -566,15 +585,6 @@ static lv_obj_t *label(lv_obj_t *parent, int y, const lv_font_t *font, uint32_t 
     lv_obj_set_style_text_color(obj, lv_color_hex(color), 0);
     lv_obj_align(obj, LV_ALIGN_TOP_MID, 0, y);
     return obj;
-}
-
-static void show_wallpaper_selection(void)
-{
-    const char *name = g_wallpaper_names[wallpaper_idx];
-    if (name && *name)
-        lv_label_set_text_fmt(wallpaper_status, "%u/%u · %s", (unsigned)wallpaper_idx + 1, g_wallpaper_count, name);
-    else
-        lv_label_set_text_fmt(wallpaper_status, "%u/%u", (unsigned)wallpaper_idx + 1, g_wallpaper_count);
 }
 
 static bool apply_wallpaper(unsigned index)
@@ -591,15 +601,8 @@ static bool apply_wallpaper(unsigned index)
 
     wallpaper_idx = (uint8_t)index;
     lv_img_set_src(wallpaper_image, g_wallpapers[index]);
-    show_wallpaper_selection();
     rt_kprintf("WATCH_WALLPAPER apply index=%u count=%u\n", index, g_wallpaper_count);
     return true;
-}
-
-static void request_wallpaper(lv_event_t *event)
-{
-    (void)event;
-    wallpaper_requested = visible_page == PAGE_FUNCTION;
 }
 
 static bool set_panel_brightness(uint8_t value)
@@ -643,28 +646,44 @@ static bool menu_play_sample(void)
     return alarm.phase == ALARM_STATE_IDLE && watch_settings_play_sample(normal_volume);
 }
 
-static enum watch_menu_contact_result menu_add_contact(const char *phone)
+static bool menu_get_contact(unsigned index, char phone[WATCH_PHONE_SIZE], bool *emergency)
+{
+    if (index >= WATCH_MAX_CONTACTS)
+        return false;
+    rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
+    memcpy(phone, stored.contacts[index], WATCH_PHONE_SIZE);
+    *emergency = (stored.emergency_mask & (1u << index)) != 0;
+    rt_mutex_release(&store_mutex);
+    return phone[0] != '\0';
+}
+
+static enum watch_menu_contact_result menu_save_contact(const char *phone, bool emergency)
 {
     if (!watch_valid_phone(phone))
         return MENU_CONTACT_INVALID;
 
     rt_mutex_take(&store_mutex, RT_WAITING_FOREVER);
-    enum watch_menu_contact_result result = MENU_CONTACT_FULL;
     struct persisted next = stored;
-    unsigned free_slot = WATCH_MAX_CONTACTS;
+    unsigned slot = WATCH_MAX_CONTACTS;
     for (unsigned i = 0; i < WATCH_MAX_CONTACTS; ++i) {
         if (strcmp(next.contacts[i], phone) == 0) {
-            result = MENU_CONTACT_DUPLICATE;
+            slot = i;
             break;
         }
-        if (!next.contacts[i][0] && free_slot == WATCH_MAX_CONTACTS)
-            free_slot = i;
+        if (!next.contacts[i][0] && slot == WATCH_MAX_CONTACTS)
+            slot = i;
     }
-    if (result == MENU_CONTACT_FULL && free_slot < WATCH_MAX_CONTACTS) {
-        memcpy(next.contacts[free_slot], phone, strlen(phone) + 1);
+    enum watch_menu_contact_result result = MENU_CONTACT_FULL;
+    if (slot < WATCH_MAX_CONTACTS) {
+        memcpy(next.contacts[slot], phone, strlen(phone) + 1);
+        if (emergency)
+            next.emergency_mask |= 1u << slot;
+        else
+            next.emergency_mask &= ~(1u << slot);
         if (save(&next)) {
             stored = next;
             result = MENU_CONTACT_SAVED;
+            rt_kprintf("WATCH_CONTACT saved slot=%u emergency=%u\n", slot, (unsigned)emergency);
         } else {
             result = MENU_CONTACT_SAVE_FAILED;
         }
@@ -790,9 +809,9 @@ static void init_ui(void)
     lv_obj_set_style_bg_grad_dir(fade, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_main_opa(fade, LV_OPA_60, 0);
     lv_obj_set_style_bg_grad_opa(fade, LV_OPA_TRANSP, 0);
-    dial_date_shadow = label(wallpaper, 55, &watch_dial_date, 0x000000);
+    dial_date_shadow = centered_label(wallpaper, 55, &watch_dial_date, 0x000000);
     lv_obj_set_style_text_opa(dial_date_shadow, LV_OPA_60, 0);
-    dial_date = label(wallpaper, 53, &watch_dial_date, 0xffffff);
+    dial_date = centered_label(wallpaper, 53, &watch_dial_date, 0xffffff);
     clock_row = lv_obj_create(wallpaper);
     lv_obj_add_flag(clock_row, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(dial_date, LV_OBJ_FLAG_HIDDEN);
@@ -804,46 +823,29 @@ static void init_ui(void)
     int x = 0;
     for (unsigned i = 0; i < 5; ++i) {
         const int width = i == 2 ? 32 : 83;
-        digit_shadows[i] = label(clock_row, 0, &watch_dial_digits, 0x000000);
+        digit_shadows[i] = centered_label(clock_row, 0, &watch_dial_digits, 0x000000);
         lv_obj_set_style_text_opa(digit_shadows[i], LV_OPA_60, 0);
         lv_obj_set_width(digit_shadows[i], width);
         lv_obj_align(digit_shadows[i], LV_ALIGN_LEFT_MID, x + 2, 3);
-        dial_digits[i] = label(clock_row, 0, &watch_dial_digits, 0xffffff);
+        dial_digits[i] = centered_label(clock_row, 0, &watch_dial_digits, 0xffffff);
         lv_obj_set_width(dial_digits[i], width);
         lv_obj_align(dial_digits[i], LV_ALIGN_LEFT_MID, x, 0);
         x += width;
     }
     const lv_font_t *font = &watch_cjk;
-    title = label(screen, 63, font, 0xf3f8f4);
-    reading = label(screen, 126, &lv_font_montserrat_48, 0xffffff);
-    caption = label(screen, 212, font, 0xc7d6d0);
+    title = centered_label(screen, 63, font, 0xf3f8f4);
+    reading = centered_label(screen, 126, &lv_font_montserrat_48, 0xffffff);
+    caption = centered_label(screen, 212, font, 0xc7d6d0);
     action = lv_button_create(screen);
     lv_obj_set_size(action, 300, 82);
     lv_obj_align(action, LV_ALIGN_TOP_MID, 0, 290);
     lv_obj_set_style_radius(action, 20, 0);
     lv_obj_add_event_cb(action, action_pressed, LV_EVENT_ALL, NULL);
-    action_label = label(action, 0, font, 0xffffff);
+    action_label = centered_label(action, 0, font, 0xffffff);
     lv_obj_set_width(action_label, 270);
     lv_obj_center(action_label);
-    clock_placeholder = label(wallpaper, 123, &lv_font_montserrat_48, 0xffffff);
+    clock_placeholder = centered_label(wallpaper, 123, &lv_font_montserrat_48, 0xffffff);
     lv_label_set_text(clock_placeholder, "--:--");
-    wallpaper_button = lv_button_create(screen);
-    lv_obj_set_size(wallpaper_button, 340, 56);
-    lv_obj_align(wallpaper_button, LV_ALIGN_TOP_MID, 0, 383);
-    lv_obj_set_style_radius(wallpaper_button, 18, 0);
-    lv_obj_set_style_bg_color(wallpaper_button, lv_color_hex(0x263e5a), 0);
-    lv_obj_add_event_cb(wallpaper_button, request_wallpaper, LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_t *wallpaper_label = label(wallpaper_button, 0, &watch_wallpaper_font, 0xffffff);
-    lv_obj_set_width(wallpaper_label, LV_SIZE_CONTENT);
-    lv_obj_align(wallpaper_label, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_label_set_text(wallpaper_label, "切换壁纸");
-    wallpaper_status = label(wallpaper_button, 0, &watch_wallpaper_font, 0xe0ebff);
-    lv_obj_set_width(wallpaper_status, 180);
-    lv_obj_set_style_text_align(wallpaper_status, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_long_mode(wallpaper_status, LV_LABEL_LONG_DOT);
-    lv_obj_align(wallpaper_status, LV_ALIGN_RIGHT_MID, 0, 0);
-    show_wallpaper_selection();
-    lv_obj_add_flag(wallpaper_button, LV_OBJ_FLAG_HIDDEN);
     resolve_arc = lv_arc_create(screen);
     lv_obj_set_size(resolve_arc, 210, 210);
     lv_obj_center(resolve_arc);
@@ -858,24 +860,17 @@ static void init_ui(void)
     lv_obj_remove_style(resolve_arc, NULL, LV_PART_KNOB);
     lv_obj_remove_flag(resolve_arc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(resolve_arc, LV_OBJ_FLAG_HIDDEN);
-    resolve_percent = label(resolve_arc, 0, &lv_font_montserrat_48, 0xffffff);
+    resolve_percent = centered_label(resolve_arc, 0, &lv_font_montserrat_48, 0xffffff);
     lv_obj_set_width(resolve_percent, 160);
     lv_obj_center(resolve_percent);
-    resolve_text = label(screen, 355, font, 0xffffff);
+    resolve_text = centered_label(screen, 355, font, 0xffffff);
     lv_obj_add_flag(resolve_text, LV_OBJ_FLAG_HIDDEN);
-    help_back = lv_button_create(screen);
-    lv_obj_set_size(help_back, 64, 48);
-    lv_obj_align(help_back, LV_ALIGN_TOP_LEFT, 22, 11);
-    lv_obj_set_style_bg_color(help_back, lv_color_hex(0x253332), 0);
-    lv_obj_set_style_radius(help_back, 15, 0);
-    lv_obj_add_event_cb(help_back, go_back_from_help, LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_t *back_icon = lv_label_create(help_back);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_center(back_icon);
+    help_back = watch_menu_back_button(screen, go_back_from_help);
     lv_obj_add_flag(help_back, LV_OBJ_FLAG_HIDDEN);
     static const struct watch_menu_ops operations = {
         .navigate = navigate_menu,
-        .add_contact = menu_add_contact,
+        .save_contact = menu_save_contact,
+        .get_contact = menu_get_contact,
         .get_level = menu_get_level,
         .set_level = menu_set_level,
         .play_sample = menu_play_sample,
@@ -1008,6 +1003,12 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
     const bool alarm_page = next == PAGE_ALARM;
     const bool power_page = next == PAGE_POWER_HOLD;
     const bool counting = alarm_page && watch_alarm_counting(&alarm);
+    if (next == PAGE_MENU && menu_page == MENU_WEATHER) {
+        struct watch_weather weather;
+        uint32_t age_ms;
+        bool fresh = watch_ble_weather(&weather, &age_ms) && age_ms < WEATHER_VALID_SECONDS * 1000u;
+        watch_menu_set_weather(fresh ? &weather : NULL);
+    }
     watch_menu_show(next == PAGE_MENU ? menu_page : MENU_NONE);
     if (visible_page != next) {
         static const char *const names[] = {
@@ -1025,7 +1026,6 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
                 lv_display_enable_invalidation(NULL, false);
                 lv_timer_pause(lv_display_get_refr_timer(NULL));
                 set_visible(action, false);
-                set_visible(wallpaper_button, false);
                 set_visible(help_back, false);
             } else {
                 lv_display_enable_invalidation(NULL, true);
@@ -1041,14 +1041,11 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
         rt_kprintf("WATCH_PAGE %s\n", names[next]);
         if (next == PAGE_SLEEP)
             return;
-        lv_obj_set_style_bg_color(screen, lv_color_hex(alarm_page ? 0x381b1c : 0x111919), 0);
+        lv_obj_set_style_bg_color(screen, lv_color_hex(alarm_page ? 0x381b1c : 0x080809), 0);
         lv_obj_set_style_text_color(reading, lv_color_hex(alarm_page ? 0xffcb91 : 0xffffff), 0);
         lv_obj_set_style_bg_color(action, lv_color_hex(alarm_page ? 0x286354 : 0xa73732), 0);
         set_visible(wallpaper, next == PAGE_DIAL);
-        set_visible(wallpaper_button, next == PAGE_FUNCTION);
         set_visible(help_back, next == PAGE_FUNCTION);
-        if (next == PAGE_FUNCTION)
-            show_wallpaper_selection();
         set_visible(title, next == PAGE_FUNCTION || alarm_page);
         set_visible(reading, next == PAGE_FUNCTION || alarm_page);
         set_visible(caption, next == PAGE_FUNCTION || alarm_page);
@@ -1101,13 +1098,7 @@ static void render(uint32_t now, enum watch_page next, unsigned pin, const char 
             update_label(caption, !imu_ok || now - sensor_seen > 500u ? "传感器异常" :
                                   notifying ? notice : "");
         }
-    } else if (next == PAGE_MENU) {
-        struct tm local;
-        char time[6] = "--:--";
-        if (watch_time_calendar(now, &local))
-            rt_snprintf(time, sizeof(time), "%02d:%02d", local.tm_hour, local.tm_min);
-        watch_menu_set_time(time);
-    } else {
+    } else if (next == PAGE_DIAL) {
         static const char *const weekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
         struct tm local;
         char date[32], time[6];
@@ -1149,6 +1140,7 @@ int main(void)
     watch_voice_init(alarm.cfg);
     watch_ble_init();
     init_ui();
+    watch_battery_init();
     rt_kprintf("WATCH_READY imu=%d storage=%d display=%d\n", imu_ok, store_ok, title != NULL);
     uint32_t last_draw = 0, down_since = 0;
     uint16_t seq = 0;
@@ -1205,12 +1197,12 @@ int main(void)
             manual_requested = true;
         }
         if (demo_requested) {
-            uint8_t mode = demo_requested;
-            demo_requested = 0;
+            enum demo_mode mode = demo_requested;
+            demo_requested = DEMO_NONE;
             if (alarm.phase == ALARM_STATE_IDLE && !resolved_notice) {
-                bench_alarm = mode == 2;
-                start_countdown(now, mode == 1);
-                rt_kprintf("WATCH_DEMO_START mode=%u\n", mode);
+                bench_alarm = mode == DEMO_BENCH;
+                start_countdown(now, mode == DEMO_SOS);
+                rt_kprintf("WATCH_DEMO_START mode=%u\n", (unsigned)mode);
             }
         }
         if (manual_requested) {
@@ -1294,6 +1286,10 @@ int main(void)
             page = PAGE_DIAL;
             power_reason = "key2";
             last_activity = now;
+        } else if (page == PAGE_SLEEP && wrist_event == RW_EVT_WAKE_SCREEN) {
+            page = PAGE_DIAL;
+            power_reason = "wrist_up";
+            last_activity = now;
         } else if (from != PAGE_SLEEP && page == PAGE_SLEEP) {
             power_reason = "key1";
         } else if (!wrist_protected && !key1_activity && !key2_activity && wrist_event == RW_EVT_SLEEP_SCREEN) {
@@ -1333,15 +1329,17 @@ int main(void)
                 now - last_draw >= (alarm.holding || key1_power != KEY1_POWER_IDLE ? HOLD_DRAW_MS : 150u)) {
             last_draw = now;
             render(now, next, pin, power_reason);
+            const bool show_status = visible_page == PAGE_FUNCTION || visible_page == PAGE_MENU;
+            char time[6] = "--:--";
+            struct tm local;
+            bool charging = false;
+            if (show_status && watch_time_calendar(now, &local))
+                rt_snprintf(time, sizeof(time), "%02d:%02d", local.tm_hour, local.tm_min);
+            int battery = show_status ? watch_battery_percent(now, &charging) : -1;
+            watch_menu_status(show_status, time, watch_ble_connected(), battery, charging);
         }
         if (title)
             lv_timer_handler();
-        if (wallpaper_requested) {
-            wallpaper_requested = false;
-            if (next == PAGE_FUNCTION && !manual_requested &&
-                !apply_wallpaper((wallpaper_idx + 1u) % g_wallpaper_count))
-                lv_label_set_text(wallpaper_status, "保存失败");
-        }
         if (power_blank && key1_released) {
             /* The screen blanks at full progress. Start the high-level wake
              * detector after this press ends so it cannot wake itself. */

@@ -7,6 +7,20 @@ static void little_endian(uint8_t *dest, uint64_t value, unsigned bytes)
         dest[i] = (uint8_t)(value >> (8u * i));
 }
 
+static uint64_t little_endian_read(const uint8_t *src, unsigned bytes)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < bytes; ++i)
+        value |= (uint64_t)src[i] << (8u * i);
+    return value;
+}
+
+static int32_t little_endian_read_i16(const uint8_t *src)
+{
+    uint16_t raw = (uint16_t)little_endian_read(src, 2);
+    return raw >= 0x8000u ? (int32_t)raw - 0x10000 : (int32_t)raw;
+}
+
 bool watch_valid_phone(const char *phone)
 {
     if (phone[0] != '+' || phone[1] < '1' || phone[1] > '9')
@@ -70,9 +84,7 @@ bool watch_frame_ack(const uint8_t *frame, unsigned size, uint8_t *type, uint64_
         (frame[0] != WATCH_SOS_ACK_TYPE && frame[0] != WATCH_RESOLVED_ACK_TYPE) ||
         frame[1] < 1 || frame[1] > 3)
         return false;
-    uint64_t event = 0;
-    for (unsigned i = 0; i < 8; ++i)
-        event |= (uint64_t)frame[2 + i] << (8u * i);
+    uint64_t event = little_endian_read(frame + 2, 8);
     for (unsigned i = 10; i < size; ++i)
         if (frame[i])
             return false;
@@ -92,17 +104,51 @@ bool watch_frame_time(const uint8_t *frame, unsigned size, uint32_t *local_epoch
         if (frame[i])
             return false;
 
-    uint32_t utc = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        utc |= (uint32_t)frame[2 + i] << (8u * i);
-    int offset_minutes = frame[6] | (frame[7] << 8);
-    if (offset_minutes >= 32768)
-        offset_minutes -= 65536;
+    uint32_t utc = (uint32_t)little_endian_read(frame + 2, 4);
+    int offset_minutes = (int)little_endian_read_i16(frame + 6);
     if (offset_minutes < -840 || offset_minutes > 840)
         return false;
     const int64_t local = (int64_t)utc + offset_minutes * 60;
     if (local < WATCH_TIME_MIN || local >= WATCH_TIME_LIMIT)
         return false;
     *local_epoch = (uint32_t)local;
+    return true;
+}
+
+static bool valid_wmo(uint8_t code)
+{
+    return code < 100u || code == WATCH_WEATHER_MISSING_U8;
+}
+
+static int8_t signed_weather_byte(uint8_t byte)
+{
+    return (int8_t)(byte <= INT8_MAX ? (int)byte : (int)byte - 256);
+}
+
+bool watch_frame_weather(const uint8_t *frame, unsigned size, struct watch_weather *weather)
+{
+    if (!frame || !weather || size != WATCH_FRAME_SIZE || frame[0] != WATCH_WEATHER_TYPE || frame[1] != 1 ||
+        !valid_wmo(frame[2]) || (frame[3] > 100u && frame[3] != WATCH_WEATHER_MISSING_U8))
+        return false;
+
+    int16_t temperature = (int16_t)little_endian_read_i16(frame + 5);
+    struct watch_weather next = {
+        .current_wmo = frame[2],
+        .humidity_percent = frame[3],
+        .wind_kmh = frame[4],
+        .temperature_deci_c = (int16_t)temperature,
+    };
+    for (unsigned i = 0; i < WATCH_WEATHER_DAYS; ++i) {
+        if (!valid_wmo(frame[7 + i]))
+            return false;
+        next.daily_wmo[i] = frame[7 + i];
+        next.daily_high_c[i] = signed_weather_byte(frame[10 + i]);
+        next.daily_low_c[i] = signed_weather_byte(frame[13 + i]);
+    }
+    next.fetched_at_utc = (uint32_t)little_endian_read(frame + 16, 4);
+    if (next.fetched_at_utc < WATCH_TIME_MIN || next.fetched_at_utc >= WATCH_TIME_LIMIT)
+        return false;
+
+    *weather = next;
     return true;
 }

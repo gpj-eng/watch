@@ -10,7 +10,6 @@ const alarm_cfg_t alarm_cfg_default = {
     .sos_vib_on_ms = 300u,
     .sos_vib_off_ms = 700u,
     .cancel_hold_ms = 3000u,
-    .sos_audio_max_ms = 0u,
     .vib_pwm_duty = 50u,
     /* The prototype reset at the SDK maximum with the motor running on USB. */
     .sos_audio_volume = 80u,

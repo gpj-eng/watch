@@ -4,11 +4,12 @@
 #include "alarm.h"
 
 enum wrist_screen { RW_SCREEN_OFF, RW_SCREEN_ON, RW_SCREEN_PROTECTED };
-enum wrist_event { RW_EVT_NONE, RW_EVT_SLEEP_SCREEN };
+enum wrist_event { RW_EVT_NONE, RW_EVT_SLEEP_SCREEN, RW_EVT_WAKE_SCREEN };
 enum forearm_axis { WRIST_FOREARM_X, WRIST_FOREARM_Y };
 
 typedef struct {
     float alpha, view_z_g, view_forearm_max_g, sleep_z_g;
+    int32_t raise_step_mg;
     uint16_t max_gap_ms;
     uint8_t sleep_frames;
     enum forearm_axis forearm;
@@ -19,6 +20,7 @@ struct watch_wrist {
     uint32_t last_ms;
     enum wrist_screen screen;
     uint8_t count;
+    int32_t raise_min_mg; /* lowest forearm reading since the display went dark */
     bool initialized, viewed;
 };
 

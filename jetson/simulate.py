@@ -5,11 +5,14 @@ import json
 import logging
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from protocol import (ACCEPTED, ACK_FRAME, ACK_TYPE, DEMO_NUMBERS, FAILED, FALL_TIMEOUT,
                       IMU_FRAME, IMU_TYPE, MANUAL_SOS, QUEUED, SOS_FRAME, SOS_TYPE,
                       ProtocolError, pack_phone)
 from receiver import EventStore, Receiver
+from weather import FRESH_SECONDS, WeatherFeed, fetch_weather
 
 LOG = logging.getLogger("hspi")
 
@@ -36,6 +39,30 @@ def require_rejected(receiver, frame):
     except ProtocolError:
         return
     raise AssertionError("malformed or unexpected frame passed validation")
+
+
+def simulate_weather():
+    response = {
+        "current": {"temperature_2m": -2.3, "relative_humidity_2m": 68,
+                    "wind_speed_10m": 13.6, "weather_code": 61},
+        "daily": {"weather_code": [61, 3, None], "temperature_2m_max": [9.3, -1.2, None],
+                  "temperature_2m_min": [-3.4, -5.4]},
+    }
+    with patch("weather.urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as get:
+        with patch("weather.time.time", return_value=0x6B554433):
+            frame = fetch_weather(30.2741, 120.1551)
+    require(frame == bytes.fromhex("84 01 3d 44 0e e9ff 3d03ff 09ff80 fdfb80 3344556b"),
+            "unexpected weather frame or missing forecast encoding")
+    params = parse_qs(urlsplit(get.call_args[0][0].full_url).query)
+    require(params["timezone"] == ["auto"] and params["forecast_days"] == ["3"],
+            "expected three days starting in the chosen location's local time")
+    feed = WeatherFeed(30.2741, 120.1551, "Hangzhou")
+    feed.snapshot = (100, frame)
+    with patch("weather.time.monotonic", return_value=100 + FRESH_SECONDS - 1):
+        require(feed.current() == frame, "fresh cache unavailable")
+    with patch("weather.time.monotonic", return_value=100 + FRESH_SECONDS):
+        require(feed.current() is None, "expired weather cache was reused")
+    LOG.info("SIM WEATHER PASS: Open-Meteo fields, 20-byte frame, partial forecast, cache expiry")
 
 
 def run():
@@ -124,4 +151,5 @@ def run():
         finally:
             store.close()
     LOG.info("SIM SOS PASS: crash/reopen, two recipients, manual SOS, dedup, ACK 1/2/3")
+    simulate_weather()
     LOG.info("SIM COMPLETE: no Bluetooth connection or real SMS was used")

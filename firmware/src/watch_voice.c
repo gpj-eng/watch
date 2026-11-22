@@ -120,7 +120,7 @@ static void fill_sos(int16_t *pcm, unsigned frame)
     }
 }
 
-static enum clip_result play_clip(struct voice_request request, uint32_t sos_started)
+static enum clip_result play_clip(struct voice_request request)
 {
     const bool help = request.mode == WATCH_VOICE_HELP;
     const unsigned sos_frames = SOS_VOICE_START + sizeof(voice_help_pcm) /
@@ -159,12 +159,6 @@ static enum clip_result play_clip(struct voice_request request, uint32_t sos_sta
 
     while (amplifier_ready && (help || frame < TONE_TOTAL_FRAMES) &&
             current_request().generation == request.generation) {
-        uint32_t max_ms = help ? voice_cfg->sos_audio_max_ms : 0;
-        uint32_t played_ms = watch_now_ms() - sos_started;
-        if (max_ms && played_ms >= max_ms) {
-            result = CLIP_DONE;
-            break;
-        }
         if (help)
             fill_sos(tone, frame);
         else
@@ -186,8 +180,6 @@ static enum clip_result play_clip(struct voice_request request, uint32_t sos_sta
             break;
         }
         uint32_t wait_ms = PCM_WRITE_TIMEOUT_MS - elapsed;
-        if (max_ms && max_ms - played_ms < wait_ms)
-            wait_ms = max_ms - played_ms;
         wait_audio(AUDIO_REQUEST_CHANGED | AUDIO_CACHE_AVAILABLE, rt_tick_from_millisecond(wait_ms));
     }
     if (!amplifier_ready)
@@ -238,28 +230,20 @@ static void voice_thread(void *unused)
         }
         handled = next.generation;
         if (next.mode == WATCH_VOICE_HELP) {
-            uint32_t started = watch_now_ms();
             while (current_request().generation == handled) {
-                uint32_t elapsed = watch_now_ms() - started;
-                uint32_t max_ms = voice_cfg->sos_audio_max_ms;
-                if (max_ms && elapsed >= max_ms) {
-                    publish(handled, EVT_SOS_VOICE_DONE);
-                    break;
-                }
-                enum clip_result result = play_clip(next, started);
+                enum clip_result result = play_clip(next);
                 if (result != CLIP_FAILED) {
                     if (result == CLIP_DONE)
                         publish(handled, EVT_SOS_VOICE_DONE);
                     break;
                 }
                 publish(handled, EVT_SOS_VOICE_FAILED);
-                uint32_t wait_ms = max_ms && max_ms - elapsed < 1000u ? max_ms - elapsed : 1000u;
-                if (!wait_while_current(handled, wait_ms))
+                if (!wait_while_current(handled, 1000u))
                     break;
             }
         } else if (next.mode == WATCH_VOICE_TONE) {
             while (current_request().generation == handled) {
-                if (play_clip(next, 0) == CLIP_INTERRUPTED ||
+                if (play_clip(next) == CLIP_INTERRUPTED ||
                     !wait_while_current(handled, TONE_PAUSE_MS))
                     break;
             }

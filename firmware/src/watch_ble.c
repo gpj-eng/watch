@@ -20,6 +20,9 @@ static volatile uint32_t pair_started;
 static volatile unsigned pair_pin = 1000000;
 static rt_mq_t acknowledgements;
 static rt_mq_t time_updates;
+static struct watch_weather weather_snapshot;
+static uint32_t weather_received_ms;
+static bool weather_age_saturated;
 SIBLES_ADVERTISING_CONTEXT_DECLAR(advertisement);
 
 BLE_GATT_SERVICE_DEFINE_128(watch_att_db)
@@ -55,6 +58,23 @@ static uint8_t *get_value(uint8_t connection, uint8_t index, uint16_t *len)
     return subscription;
 }
 
+static bool receive_weather(const uint8_t *frame, unsigned len)
+{
+    struct watch_weather next;
+    if (!watch_frame_weather(frame, len, &next))
+        return false;
+
+    const rt_base_t level = rt_hw_interrupt_disable();
+    /* Retransmissions of a cached forecast must leave the original age intact. */
+    if (next.fetched_at_utc > weather_snapshot.fetched_at_utc) {
+        weather_snapshot = next;
+        weather_received_ms = watch_now_ms();
+        weather_age_saturated = false;
+    }
+    rt_hw_interrupt_enable(level);
+    return true;
+}
+
 static uint8_t set_value(uint8_t connection, sibles_set_cbk_t *p)
 {
     if (connection != conn)
@@ -70,6 +90,8 @@ static uint8_t set_value(uint8_t connection, sibles_set_cbk_t *p)
                 return SIBLES_ATT_ERR_WRITE_NOT_PERMITTED;
             return time_updates && rt_mq_send(time_updates, &epoch, sizeof(epoch)) == RT_EOK ? 0 : 0x80;
         }
+        if (p->value[0] == WATCH_WEATHER_TYPE)
+            return receive_weather(p->value, p->len) ? 0 : SIBLES_ATT_ERR_WRITE_NOT_PERMITTED;
         return rt_mq_send(acknowledgements, p->value, WATCH_FRAME_SIZE) == RT_EOK ? 0 : 0x80;
     }
     return SIBLES_ATT_ERR_WRITE_NOT_PERMITTED;
@@ -206,6 +228,12 @@ void watch_ble_poll(void)
         pair_open = false;
         pair_pin = 1000000;
     }
+    const rt_base_t level = rt_hw_interrupt_disable();
+    /* Saturate long-lived ages before the elapsed interval can wrap. */
+    if (weather_snapshot.fetched_at_utc && !weather_age_saturated &&
+        watch_now_ms() - weather_received_ms >= UINT32_MAX / 2u)
+        weather_age_saturated = true;
+    rt_hw_interrupt_enable(level);
 }
 
 bool watch_ble_connected(void)
@@ -248,6 +276,18 @@ bool watch_ble_device_id(uint8_t id[WATCH_DEVICE_ID_SIZE])
 bool watch_ble_time(uint32_t *local_epoch)
 {
     return time_updates && rt_mq_recv(time_updates, local_epoch, sizeof(*local_epoch), 0) == RT_EOK;
+}
+
+bool watch_ble_weather(struct watch_weather *weather, uint32_t *age_ms)
+{
+    const rt_base_t level = rt_hw_interrupt_disable();
+    const bool available = weather_snapshot.fetched_at_utc != 0;
+    if (available) {
+        *weather = weather_snapshot;
+        *age_ms = weather_age_saturated ? UINT32_MAX : watch_now_ms() - weather_received_ms;
+    }
+    rt_hw_interrupt_enable(level);
+    return available;
 }
 
 void watch_ble_pair(void)

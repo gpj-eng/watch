@@ -104,6 +104,22 @@ export TENCENT_SMS_SIGN TENCENT_SMS_TEMPLATE_ID HSPI_SMS_ALLOWED_NUMBERS
 
 网关按手表地址及运行模式分别建库，避免实发之前的模拟事件。库默认在 `~/.local/state/hspi/`，联系人保存在数据库中，终端日志只记录事件编号和联系人数量。若短信请求超时或程序在请求期间退出，数据库会保留可查询的失败状态，避免送达状态未知时自动再发。用事件编号在云后台核对后再决定是否重发。
 
+### 7. 选配天气
+
+提供经纬度即可启用天气。例如以下命令查询杭州，城市名用于网关日志。运行需要 Jetson 可访问 Open-Meteo 的 HTTPS 接口。使用前请核对服务条款及适用额度。 [Open-Meteo 预报接口](https://open-meteo.com/en/docs) · [服务条款](https://open-meteo.com/en/terms)
+
+```bash
+cd ~/jetson
+/usr/bin/python3 -B gateway.py ble --watch AA:BB:CC:DD:EE:FF \
+  --weather-latitude 30.2741 --weather-longitude 120.1551 --weather-city 杭州
+```
+
+也可在网关服务环境中设置 `WATCH_WEATHER_LATITUDE`、`WATCH_WEATHER_LONGITUDE` 和可选的 `WATCH_WEATHER_CITY`。命令行参数优先。经纬度留空时，网关处于原有接收模式。
+
+天气任务独立运行，启动即取数，每 30 分钟刷新，失败后隔 5 分钟重试。配对连接建立后会发送 2 小时内的缓存。天气写入采用异步 GATT 请求，SOS 回执优先。断网时仍可使用未过期的结果。过期后，天气页显示暂无数据，恢复联网后重新更新。预报的日期以配置地点的当地时区为准。
+
+网关日志 `Weather refreshed` 表示获取到数据，`WEATHER_SYNC sent` 表示 GATT 写入完成。打开手表天气页核对当前气温、湿度、风速和三日温度。关闭再恢复 Jetson 网络可验证缓存和自动恢复。在无板卡的环境下，运行 `gateway.py simulate` 检查 `SIM WEATHER PASS`。
+
 ### BLE 帧协议
 
 服务 UUID 为 `6e400001-b5a3-f393-e0a9-e50e24dcca9e`。手表的 TX 通知为 `6e400003-b5a3-f393-e0a9-e50e24dcca9e`，手表的 RX 带响应写入为 `6e400002-b5a3-f393-e0a9-e50e24dcca9e`。每条通知或写入恰好 20 字节，适用默认 ATT MTU 23。多字节整数按小端排列。
@@ -121,6 +137,12 @@ export TENCENT_SMS_SIGN TENCENT_SMS_TEMPLATE_ID HSPI_SMS_ALLOWED_NUMBERS
 | | 2–9、10–19 | `uint64` 事件编号、十个零 |
 | 校时，Jetson → 手表 | 0、1 | `0x82`、版本号 `1` |
 | | 2–5、6–7、8–19 | `uint32` UTC Unix 秒、`int16` 本地偏移分钟数（北京时间为 480）、十二个零 |
+| 天气，Jetson → 手表 | 0、1 | `0x84`、版本号 `1` |
+| | 2–4 | 当前 WMO 天气码、相对湿度 %、风速 km/h，`255` 表示缺失 |
+| | 5–6 | `int16` 当前气温，单位为 0.1 °C |
+| | 7–9 | 连续三天的 WMO 天气码，`255` 表示缺失 |
+| | 10–12、13–15 | 三天的最高温和最低温，均为 `int8`、单位 °C，`-128` 表示缺失 |
+| | 16–19 | `uint32` 数据获取时刻，UTC Unix 秒 |
 
 网关在每次认证连接订阅成功后写入校时帧。`TIME_SYNC sent` 表示 GATT 写入完成。手表以 `WATCH_TIME_SYNC` 记录 RTC 写入和 Flash 保存结果。
 

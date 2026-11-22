@@ -106,18 +106,62 @@ static void before_wrist_sleep(struct wrist_trial *t)
     assert(t->wrist.count == t->cfg.sleep_frames - 1u);
 }
 
+/* Raise to wake, ported from InfiniTime ShouldRaiseWake(): the viewing pose plus a real
+   rotation of the forearm wakes the display; an arm swing never does. */
+static void test_wrist_wake(void)
+{
+    struct wrist_trial t = {.cfg = wrist_defaults, .now = 1000u, .screen = RW_SCREEN_OFF};
+
+    /* Walking: each swing satisfies the raw pose for two frames and turns the forearm far
+       enough to pass the step threshold, but the filter never reaches the viewing pose. */
+    const struct watch_imu swing_up = {.ax = -300, .ay = -500, .az = -700};
+    const struct watch_imu swing_rest = {.ax = 121, .ay = -994, .az = 200};
+    for (unsigned i = 0; i < 240; ++i)
+        assert(frame(&t, i % 8 < 2 ? swing_up : swing_rest) == RW_EVT_NONE);
+    assert(t.wrist.screen == RW_SCREEN_OFF);
+
+    /* A hanging arm is not a raise. */
+    quiet_frames(&t, down, 40);
+
+    /* A shallow raise that never turns the face up does not wake. */
+    const struct watch_imu half = {.ax = -221, .ay = -700, .az = -466};
+    quiet_frames(&t, half, 40);
+    assert(t.wrist.screen == RW_SCREEN_OFF);
+
+    /* Turning the wrist into the viewing pose wakes the display. */
+    quiet_frames(&t, down, 10);
+    bool woke = false;
+    for (unsigned i = 1; i <= 12 && !woke; ++i) {
+        struct watch_imu raise = {
+            .ax = down.ax + (view.ax - down.ax) * (int32_t)i / 12,
+            .ay = down.ay + (view.ay - down.ay) * (int32_t)i / 12,
+            .az = down.az + (view.az - down.az) * (int32_t)i / 12,
+        };
+        woke = frame(&t, raise) == RW_EVT_WAKE_SCREEN;
+    }
+    for (unsigned i = 0; i < 30 && !woke; ++i)
+        woke = frame(&t, view) == RW_EVT_WAKE_SCREEN;
+    assert(woke && t.wrist.screen == RW_SCREEN_ON);
+
+    /* A display blanked while the watch is already held up waits for the arm to drop. */
+    struct wrist_trial idle = {.cfg = wrist_defaults, .now = 1000u, .screen = RW_SCREEN_OFF};
+    quiet_frames(&idle, view, 60);
+    assert(idle.wrist.screen == RW_SCREEN_OFF);
+    quiet_frames(&idle, down, 20);
+    unsigned held = 0;
+    while (frame(&idle, view) != RW_EVT_WAKE_SCREEN && ++held < 30)
+        ;
+    assert(held < 30 && idle.wrist.screen == RW_SCREEN_ON);
+
+    /* The alarm page is already lit and must not take a wrist wake. */
+    idle.screen = RW_SCREEN_PROTECTED;
+    quiet_frames(&idle, view, 60);
+    assert(idle.wrist.screen == RW_SCREEN_PROTECTED);
+}
+
 static void test_wrist_sleep(void)
 {
     struct wrist_trial t = {.cfg = wrist_defaults, .now = UINT32_MAX - 450u};
-    /* A former wake gesture has no effect with the display off. */
-    for (int sign = -1; sign <= 1; sign += 2) {
-        struct watch_imu turn = down;
-        turn.gy = sign * 1100;
-        quiet_frames(&t, down, 20);
-        quiet_frames(&t, turn, 1);
-        quiet_frames(&t, view, 35);
-    }
-
     /* A key can wake the watch while the wrist is already down. */
     t.screen = RW_SCREEN_ON;
     quiet_frames(&t, down, 40);
@@ -147,6 +191,7 @@ static void test_wrist_sleep(void)
 int main(void)
 {
     test_alarm();
+    test_wrist_wake();
     test_wrist_sleep();
     struct watch_detector detector = {0};
     const struct watch_imu still = {.az = 1000}, impact = {.ax = 3400, .gx = 2500}, settled = {.ay = 1000};

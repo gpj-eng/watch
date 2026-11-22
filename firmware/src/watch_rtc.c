@@ -24,6 +24,11 @@ void SystemPowerOnModeInit(void)
     boot.calendar.dr = hwp_rtc->DR;
     uint32_t wake;
     HAL_PMU_CheckBootMode(&boot.mode, &wake); /* consumes the hardware flags */
+
+    /* Power-key hold time, 32000 Hz ticks like the SDK board init. The same
+     * counter also hard-resets a running chip, so it must stay well above the
+     * ~3 s shutdown hold; 8 s is what power-on from hibernate takes anyway. */
+    hwp_pmuc->PWRKEY_CNT = 32000u * 8u;
 }
 
 pm_power_on_mode_t SystemPowerOnModeGet(void)
@@ -54,8 +59,8 @@ void watch_rtc_log_reset(void)
             reason = "power_key_reset";
         break;
     }
-    rt_kprintf("WATCH_RESET reason=%s pmu_cr=%08x wsr=%08x backup_init=%u\n",
-               reason, boot.cr, boot.wsr, boot.backup);
+    rt_kprintf("WATCH_RESET reason=%s pmu_cr=%08x wsr=%08x backup_init=%u pwrkey_cnt=%08x\n",
+               reason, boot.cr, boot.wsr, boot.backup, hwp_pmuc->PWRKEY_CNT);
     rt_kprintf("WATCH_RTC_RAW tr=%08x dr=%08x isr=%08x cr=%08x psclr=%08x\n",
                boot.calendar.tr, boot.calendar.dr, boot.calendar.isr, boot.rtc_cr, boot.prescaler);
 }
@@ -115,31 +120,27 @@ void watch_rtc_hibernate(bool usb)
 {
     /* On 52x RTC_CR.LPCKSEL selects the RTC crystal. The PMU LP mux is
      * separate. The BSP selects RC32 there during startup. */
-    int wake_pin = HAL_HPAON_QueryWakeupPin(hwp_gpio1, WATCH_POWER_KEY_PIN);
     if (HAL_GPIO_ReadPin(hwp_gpio1, WATCH_POWER_KEY_PIN) != GPIO_PIN_RESET) {
         rt_kprintf("WATCH_HIBERNATE refused key_pressed\n");
         return;
     }
     if (!(hwp_pmuc->LXT_CR & PMUC_LXT_CR_RDY) || !HAL_RTC_LXT_ENABLED() ||
             (hwp_rtc->ISR & RTC_ISR_INIT) || !(hwp_pmuc->CR & PMUC_CR_SEL_LPCLK) ||
-            wake_pin < 0 || HAL_PIN_Set(PAD_PA34, GPIO_A34, PIN_PULLDOWN, 1) != 0 ||
-            HAL_PMU_SelectWakeupPin(0, wake_pin) != HAL_OK ||
-            HAL_PMU_EnablePinWakeup(0, AON_PIN_MODE_HIGH) != HAL_OK) {
-        rt_kprintf("WATCH_HIBERNATE refused rtc_cr=%08x lxt=%08x pmu_cr=%08x wake_pin=%d\n",
-                   hwp_rtc->CR, hwp_pmuc->LXT_CR, hwp_pmuc->CR, wake_pin);
+            HAL_PIN_Set(PAD_PA34, GPIO_A34, PIN_PULLDOWN, 1) != 0) {
+        rt_kprintf("WATCH_HIBERNATE refused rtc_cr=%08x lxt=%08x pmu_cr=%08x\n",
+                   hwp_rtc->CR, hwp_pmuc->LXT_CR, hwp_pmuc->CR);
         return;
     }
-    /* Require about one second of continuous high at the PMU wake pin.
-     * The PMU count uses the board's RC32 clock, independent of RTC LXT. */
-    _Static_assert(RC32K_FREQ <= (PMUC_WKUP_CNT_PIN0_CNT_Msk >> PMUC_WKUP_CNT_PIN0_CNT_Pos),
-                   "KEY1 wake duration exceeds the PMU counter");
-    MODIFY_REG(hwp_pmuc->WKUP_CNT, PMUC_WKUP_CNT_PIN0_CNT_Msk,
-               (uint32_t)RC32K_FREQ << PMUC_WKUP_CNT_PIN0_CNT_Pos);
+    /* KEY1 is the PMU power key too, so a long press wakes hibernate without
+     * any WER bit. The PA34 level wake is retired: on USB power it read high
+     * and booted the watch 11..42 s into sleep (WSR.PIN0). Clear it explicitly
+     * because WER survives hibernate and an earlier build may have set it. */
+    HAL_PMU_DisablePinWakeup(0);
     struct watch_rtc_sample sample = watch_rtc_read();
     uint32_t epoch = 0;
     watch_rtc_valid(sample, &epoch);
-    rt_kprintf("WATCH_HIBERNATE enter vbus=%d wake=PA34 wake_ticks=%u rtc=lxt epoch=%u wer=%08x\n",
-               usb, (unsigned)RC32K_FREQ, epoch, hwp_pmuc->WER);
+    rt_kprintf("WATCH_HIBERNATE enter vbus=%d wake=pwrkey rtc=lxt epoch=%u wer=%08x\n",
+               usb, epoch, hwp_pmuc->WER);
     rt_hw_interrupt_disable();
     /* LDO3 powers the watch peripherals. The RTC stays on the always-on rail. */
     HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, false, false);

@@ -29,7 +29,6 @@ typedef struct {
     uint32_t vib_urgent_on_ms, vib_urgent_off_ms;
     uint32_t sos_vib_on_ms, sos_vib_off_ms;
     uint32_t cancel_hold_ms;
-    uint32_t sos_audio_max_ms;
     uint8_t vib_pwm_duty;
     uint8_t sos_audio_volume;
 } alarm_cfg_t;

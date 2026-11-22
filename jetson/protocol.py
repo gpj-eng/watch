@@ -12,7 +12,10 @@ IMU_TYPE = 0x01
 SOS_TYPE = 0x02
 ACK_TYPE = 0x81
 TIME_SYNC_TYPE = 0x82
+WEATHER_SYNC_TYPE = 0x84
 WATCH_OFFSET_MINUTES = 480
+WATCH_TIME_MIN = 1735689600
+WATCH_TIME_LIMIT = 4102444800
 QUEUED = 1
 ACCEPTED = 2
 FAILED = 3
@@ -26,6 +29,7 @@ IMU_FRAME = struct.Struct("<BBHI6h")
 SOS_FRAME = struct.Struct("<BBQBB8s")
 ACK_FRAME = struct.Struct("<BBQ10x")
 TIME_SYNC_FRAME = struct.Struct("<BBIh12x")
+WEATHER_SYNC_FRAME = struct.Struct("<BBBBBh3B3b3bI")
 Imu = namedtuple("Imu", "seq uptime_ms ax ay az gx gy gz")
 Sos = namedtuple("Sos", "reason event_id index count phone")
 
@@ -85,6 +89,13 @@ def ack(event_id, status):
 
 def time_sync(utc_epoch):
     local_epoch = utc_epoch + WATCH_OFFSET_MINUTES * 60
-    if not 1735689600 <= local_epoch < 4102444800:
+    if not WATCH_TIME_MIN <= local_epoch < WATCH_TIME_LIMIT:
         raise ValueError("Jetson clock outside the supported watch date range")
     return TIME_SYNC_FRAME.pack(TIME_SYNC_TYPE, 1, utc_epoch, WATCH_OFFSET_MINUTES)
+
+
+def weather_sync(code, humidity, wind_kmh, temp_tenths, days, highs, lows, utc_epoch):
+    if not WATCH_TIME_MIN <= utc_epoch < WATCH_TIME_LIMIT:
+        raise ValueError("Jetson clock outside the supported watch date range")
+    return WEATHER_SYNC_FRAME.pack(WEATHER_SYNC_TYPE, 1, code, humidity, wind_kmh,
+                                   temp_tenths, *days, *highs, *lows, utc_epoch)

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from protocol import ACK_FRAME, ProtocolError, RX_UUID, SERVICE_UUID, TX_UUID, time_sync
 from receiver import EventStore, Receiver
+from weather import WeatherFeed
 
 LOG = logging.getLogger("hspi")
 BLUEZ = "org.bluez"
@@ -21,6 +22,7 @@ SERVICE = BLUEZ + ".GattService1"
 CHAR = BLUEZ + ".GattCharacteristic1"
 PROPS = "org.freedesktop.DBus.Properties"
 OBJECTS = "org.freedesktop.DBus.ObjectManager"
+WEATHER_WRITE_RETRY = 60
 
 
 class BleGateway:
@@ -42,6 +44,8 @@ class BleGateway:
         self.acks = {}
         self.ack_in_flight = None
         self.retry_ack_at = 0
+        self.weather = WeatherFeed(*config.weather_location) if config.weather_location else None
+        self.weather_in_flight = None
 
     def interface(self, path, name):
         return self.dbus.Interface(self.bus.get_object(BLUEZ, path, introspect=False), name)
@@ -78,7 +82,8 @@ class BleGateway:
         self.acks[event_id] = payload
 
     def write_ack(self, rx):
-        if self.ack_in_flight is not None or not self.acks or time.monotonic() < self.retry_ack_at:
+        if (self.ack_in_flight is not None or self.weather_in_flight is not None or
+                not self.acks or time.monotonic() < self.retry_ack_at):
             return
         event_id = next(iter(self.acks))
         payload = self.acks.pop(event_id)
@@ -150,6 +155,8 @@ class BleGateway:
         loop = self.glib.MainLoop()
         self.receiver.new_connection()
         last_poll = time.monotonic()
+        weather_sent = None
+        weather_retry_at = 0
 
         def notification(interface, changed, invalidated):
             if interface != CHAR or "Value" not in changed:
@@ -170,6 +177,36 @@ class BleGateway:
             if interface == DEVICE and "Connected" in changed and not changed["Connected"]:
                 loop.quit()
 
+        def write_weather(now):
+            if (self.weather is None or self.weather_in_flight is not None or
+                    self.ack_in_flight is not None or self.acks or now < weather_retry_at):
+                return
+            payload = self.weather.current()
+            if payload is None or payload == weather_sent:
+                return
+            pending = object()
+            self.weather_in_flight = pending
+
+            def written():
+                nonlocal weather_sent
+                if self.weather_in_flight is pending:
+                    self.weather_in_flight = None
+                    weather_sent = payload
+                    LOG.info("WEATHER_SYNC sent to %s", self.config.watch)
+
+            def failed(error):
+                nonlocal weather_retry_at
+                if self.weather_in_flight is pending:
+                    self.weather_in_flight = None
+                    weather_retry_at = time.monotonic() + WEATHER_WRITE_RETRY
+                    LOG.warning("WEATHER_SYNC write failed: %s", error.get_dbus_name())
+
+            try:
+                rx.WriteValue(self.dbus.ByteArray(payload), self.dbus.Dictionary({}, signature="sv"),
+                              reply_handler=written, error_handler=failed, timeout=1)
+            except self.dbus.DBusException as error:
+                failed(error)
+
         def tick():
             nonlocal last_poll
             try:
@@ -184,6 +221,7 @@ class BleGateway:
                         return True
                 self.service_sms()
                 self.write_ack(rx)
+                write_weather(now)
             except (self.dbus.DBusException, sqlite3.Error) as exc:
                 LOG.warning("BLE session interrupted (%s)", type(exc).__name__)
                 loop.quit()
@@ -204,6 +242,7 @@ class BleGateway:
                     LOG.warning("TIME_SYNC unavailable: %s", exc)
             loop.run()
         finally:
+            self.weather_in_flight = None
             if self.ack_in_flight is not None:
                 event_id, payload = self.ack_in_flight
                 self.acks.setdefault(event_id, payload)
@@ -217,6 +256,8 @@ class BleGateway:
                 pass
 
     def run(self):
+        if self.weather:
+            self.weather.start()
         try:
             while True:
                 try:
@@ -225,6 +266,8 @@ class BleGateway:
                     LOG.warning("Connection not ready: %s", exc)
                 time.sleep(3)
         finally:
+            if self.weather:
+                self.weather.close()
             if self.executor:
                 self.executor.shutdown(wait=True)
                 if self.sending is not None:
@@ -247,6 +290,12 @@ def parse_args():
     ble.add_argument("--live-sms", action="store_true", help="Enable live Tencent SMS")
     ble.add_argument("--confirm-encrypted-gatt", action="store_true",
                      help="Confirm watch firmware and pairing enforce link encryption")
+    ble.add_argument("--weather-latitude", type=float, default=os.getenv("WATCH_WEATHER_LATITUDE") or None,
+                     help="Open-Meteo latitude, or set WATCH_WEATHER_LATITUDE")
+    ble.add_argument("--weather-longitude", type=float, default=os.getenv("WATCH_WEATHER_LONGITUDE") or None,
+                     help="Open-Meteo longitude, or set WATCH_WEATHER_LONGITUDE")
+    ble.add_argument("--weather-city", default=os.getenv("WATCH_WEATHER_CITY") or None,
+                     help="Optional label in gateway logs, or set WATCH_WEATHER_CITY")
     options = parser.parse_args()
     if options.mode is None:
         parser.error("select simulate or ble")
@@ -257,6 +306,14 @@ def parse_args():
             parser.error("--adapter requires a BlueZ adapter name, e.g. hci0")
         if options.live_sms and (options.bench_unpaired or not options.confirm_encrypted_gatt):
             parser.error("--live-sms requires pairing and confirmed --confirm-encrypted-gatt")
+        options.weather_location = None
+        if options.weather_latitude is not None or options.weather_longitude is not None or options.weather_city:
+            latitude, longitude = options.weather_latitude, options.weather_longitude
+            if latitude is None or longitude is None or not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                parser.error("weather needs a latitude between -90 and 90 and a longitude between -180 and 180")
+            if options.bench_unpaired:
+                parser.error("weather needs a paired watch")
+            options.weather_location = latitude, longitude, options.weather_city
     return options
 
 
