@@ -45,3 +45,7 @@ venv/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Internal planning documents (local only)
+/*.docx
+/*.xlsx
